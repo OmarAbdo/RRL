@@ -16,15 +16,13 @@ set.seed(42)
 # Ensure Keras (with TensorFlow backend) is installed and configured.
 # If you encounter "Valid installation of TensorFlow not found" or "No module named 'tensorflow'",
 # run the following commands in your R console:
-# install.packages("reticulate") # Install reticulate if not already installed
-# library(reticulate)
-# reticulate::install_miniconda() # Installs Miniconda, a minimal Python distribution
-# reticulate::conda_install("r-reticulate", c("tensorflow", "keras"), forge = TRUE) # Installs TF and Keras
+# library(keras)
+# install_keras(method = "conda", python_version = "3.10")
 # After installation, you might need to restart your R session.
 
 # --- Ex1: Markov Chains ---
 # Stochastic process: future state depends only on current state.
-# Finance example: Credit rating transitions.
+# Finance example: Credit rating transitions. Going from one rating to another (e.g., AAA to AA) is independent of past ratings.
 
 # --- Ex2: Market Data Preparation ---
 get_spy_returns <- function(start_date = "2015-01-01") {
