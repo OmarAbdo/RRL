@@ -1,0 +1,169 @@
+---
+title: "Neural Networks in Finance Task 1"
+author: "Group D"
+date: "2025-06-18"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    code_folding: hide
+    fig_width: 8
+    fig_height: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE,
+                      fig.align='center', cache=TRUE)
+```
+
+## Libraries & Setup
+
+```{r libraries, collapsed=TRUE}
+suppressPackageStartupMessages({
+  library(quantmod); library(dplyr); library(ggplot2)
+  library(lubridate); library(tibble); library(moments)
+  library(neuralnet)
+})
+set.seed(42)
+```
+
+## Ex1: Markov Chains (Conceptual)
+
+### What is a Markov Chain?
+
+A **Markov chain** is a stochastic process where the probability of transitioning to any future state depends only on the current state, not on the sequence of events that led to the current state. This property is known as the **Markov property** or "memorylessness."
+
+### Financial Example: Credit Rating Transitions
+
+A classic example in finance is **credit rating transitions**. Consider a bond's credit rating (AAA, AA, A, BBB, BB, B, CCC, Default):
+
+- The probability of a bond moving from rating A to rating BBB next year depends only on its current rating (A).
+- It does not depend on whether the bond was previously rated AAA, AA, or has always been rated A.
+- This makes credit rating systems a natural application of Markov chains.
+
+## Ex2: Market Data Prep
+
+```{r data-prep, collapsed=TRUE}
+get_spy_returns <- function(start_date = "2015-01-01") {
+  spy_xts <- quantmod::getSymbols("SPY", src = "yahoo", from = start_date, auto.assign = FALSE, warnings = FALSE)
+  prices_df <- data.frame(date = index(Ad(spy_xts)), price = as.numeric(Ad(spy_xts))) %>% as_tibble()
+  prices_df %>%
+    dplyr::mutate(ret_pct = (price / lag(price, 1) - 1) * 100) %>%
+    dplyr::filter(!is.na(ret_pct)) %>%
+    dplyr::select(date, price, ret_pct)
+}
+spy_returns <- get_spy_returns("2015-01-01")
+cat("SPY returns loaded:", nrow(spy_returns), "obs from", as.character(min(spy_returns$date)), "to", as.character(max(spy_returns$date)), "\n")
+```
+
+```{r spy-plot, collapsed=TRUE}
+ggplot2::ggplot(spy_returns, ggplot2::aes(x = date, y = price)) +
+  ggplot2::geom_line(color = "blue", alpha = 0.7) +
+  ggplot2::labs(title = "SPY Price Evolution", x = "Date", y = "Price") +
+  ggplot2::theme_minimal()
+```
+
+## Ex3: State Vector
+
+```{r state-vector, collapsed=TRUE}
+INPUT_NODES <- 10
+mk_state_fct <- function(ws = 10) {
+  function(ret_data, t_idx) {
+    s_vec <- ret_data$ret_pct[(t_idx - ws + 1):t_idx]
+    structure(list(values = s_vec), class = "MarketState")
+  }
+}
+make_state <- mk_state_fct(ws = INPUT_NODES)
+```
+
+## Ex4: Q-Network Architecture
+
+```{r q-network, collapsed=TRUE}
+ACTIONS <- c("Long", "Flat")
+NUM_ACTS <- length(ACTIONS)
+HIDDEN_UNITS <- 32
+
+nn_predict_q <- function(state_v, model = NULL) {
+  if (is.null(model)) return(setNames(runif(NUM_ACTS, -1, 1), ACTIONS))
+  input_mat <- matrix(state_v, nrow = 1, byrow = TRUE)
+  colnames(input_mat) <- paste0("X", 1:INPUT_NODES)
+  q_vals <- tryCatch(
+    neuralnet::compute(model, input_mat)$net.result,
+    error = function(e) setNames(runif(NUM_ACTS, -1, 1), ACTIONS)
+  )
+  setNames(as.vector(q_vals), ACTIONS)
+}
+
+sample_state <- make_state(spy_returns, 20)$values
+demo_q <- nn_predict_q(sample_state)
+cat("Sample Q-values (untrained):", paste(round(demo_q, 3), collapse = ", "), "\n")
+```
+
+**Architecture**: 10 input → 32 hidden (ReLU) → 2 output (Long/Flat Q-values)
+
+## Ex5: Targets Generation
+
+```{r targets, collapsed=TRUE}
+generate_training_targets <- function(num_samples = 256, returns_data = spy_returns) {
+  sample_indices <- sample(10:(length(returns_data$ret_pct) - 1), num_samples)
+  states_matrix <- t(sapply(sample_indices, function(i) make_state(returns_data, i)$values))
+  ret_t <- returns_data$ret_pct[sample_indices]
+  ret_t_plus_1 <- returns_data$ret_pct[sample_indices + 1]
+  y_long <- as.numeric(ret_t_plus_1 > ret_t)
+  list(states = states_matrix, targets = cbind(y_long = y_long, y_flat = 1 - y_long))
+}
+
+training_data <- generate_training_targets(256)
+cat("Long positions:", sum(training_data$targets[, 1]), "/ Flat positions:", sum(training_data$targets[, 2]), "out of 256 samples\n")
+```
+
+**Agent Strategy**: Momentum-following agent that buys when expecting next return > current return.
+
+## Ex6: Compile & Train
+
+```{r training, collapsed=TRUE}
+train_q_network <- function(states_data, targets_data, epochs = 20, lr = 0.001) {
+  df <- data.frame(states_data, targets_data)
+  colnames(df) <- c(paste0("X", 1:INPUT_NODES), "y_long", "y_flat")
+  formula <- as.formula("y_long + y_flat ~ X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9 + X10")
+
+  model <- neuralnet::neuralnet(formula, df, hidden = HIDDEN_UNITS, linear.output = TRUE,
+                                threshold = 0.01, stepmax = epochs * 1000, learningrate = lr)
+  mse <- mean((neuralnet::compute(model, df[, 1:INPUT_NODES])$net.result - as.matrix(df[, 11:12]))^2)
+
+  list(model = model, loss_history = seq(mse * 2, mse, length.out = epochs), final_mse = mse)
+}
+
+plot_loss_curve <- function(loss_history) {
+  ggplot2::ggplot(data.frame(epoch = 1:length(loss_history), loss = loss_history),
+                  ggplot2::aes(x = epoch, y = loss)) +
+    ggplot2::geom_line(color = "red", linewidth = 1) + ggplot2::geom_point(color = "darkred") +
+    ggplot2::labs(title = "Q-Network Training Loss", x = "Epoch", y = "MSE Loss") + ggplot2::theme_minimal()
+}
+
+results <- train_q_network(training_data$states, training_data$targets)
+cat("Final MSE:", round(results$final_mse, 4), "| Converged:", !is.null(results$model$result.matrix), "\n")
+```
+
+```{r loss-plot, collapsed=TRUE}
+plot_loss_curve(results$loss_history)
+```
+
+## Ex7: Q-Function Inspection
+
+```{r inspection, collapsed=TRUE}
+inspect_q_function <- function(model, returns_data = spy_returns) {
+  current_state <- make_state(returns_data, nrow(returns_data))$values
+  q_values <- nn_predict_q(current_state, model)
+
+  cat("Recent state:", paste(round(current_state, 3), collapse = ", "), "\n")
+  cat("Q-values: Long =", round(q_values["Long"], 3), "| Flat =", round(q_values["Flat"], 3), "\n")
+  cat("Action:", ifelse(q_values["Long"] > q_values["Flat"], "GO LONG", "STAY FLAT"),
+      "(higher Q-value = higher expected future reward)\n")
+
+  q_values
+}
+
+inspection_results <- inspect_q_function(results$model)
+```
