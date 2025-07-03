@@ -1,0 +1,348 @@
+---
+title: "Neural Networks in Finance - Task 1"
+author: "Group D"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  cache = FALSE,
+  class.output = "fold-hide",
+  class.message = "fold-hide",
+  class.warning = "fold-hide",
+  class.error = "fold-hide",
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r libraries, include=FALSE}
+# Core libraries for financial analysis and neural networks
+suppressPackageStartupMessages({
+  library(quantmod)
+  library(dplyr)
+  library(ggplot2)
+  library(lubridate)
+  library(tibble)
+  library(moments)
+  library(keras) # Replaced neuralnet with keras for better deep learning support
+})
+
+# Set seed for reproducibility
+set.seed(42)
+```
+
+## Exercise 1: Markov Chains in Finance
+
+Markov chains represent stochastic processes where future states depend only on the current state, not on the sequence of events that preceded it. In finance, this concept is particularly useful for modeling credit rating transitions, where a company's future credit rating depends primarily on its current rating rather than its historical rating path.
+
+## Exercise 2: Market Data Preparation
+
+```{r market_data, class.output="fold-hide"}
+#' Retrieve and process SPY returns data
+#' 
+#' @param start_date Character string representing start date for data retrieval
+#' @return Tibble containing date, price, and return percentage columns
+get_spy_returns <- function(start_date = "2015-01-01") {
+  # Fetch raw market data
+  raw_data <- quantmod::getSymbols(
+    "SPY", 
+    src = "yahoo", 
+    from = start_date, 
+    auto.assign = FALSE, 
+    warnings = FALSE
+  )
+  
+  # Transform to clean data frame structure
+  prices_df <- data.frame(
+    date = index(Ad(raw_data)), 
+    price = as.numeric(Ad(raw_data))
+  ) %>% 
+    as_tibble()
+  
+  # Calculate percentage returns
+  prices_df %>%
+    dplyr::mutate(
+      return_percentage = (price / lag(price, 1) - 1) * 100
+    ) %>%
+    dplyr::filter(!is.na(return_percentage)) %>%
+    dplyr::select(date, price, return_percentage)
+}
+
+# Load SPY data
+spy_returns <- get_spy_returns("2015-01-01")
+cat("SPY returns loaded:", nrow(spy_returns), "observations\n")
+```
+
+### SPY Price Visualization
+
+```{r spy_price_plot, class.output="fold-hide", fig.show="hold"}
+price_plot <- ggplot2::ggplot(spy_returns, ggplot2::aes(x = date, y = price)) +
+  ggplot2::geom_line(color = "blue", alpha = 0.7, size = 0.8) +
+  ggplot2::labs(
+    title = "SPY Price Evolution Over Time",
+    subtitle = "S&P 500 ETF Historical Prices",
+    x = "Date", 
+    y = "Price (USD)"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12)
+  )
+
+print(price_plot)
+```
+
+## Exercise 3: State Vector Implementation
+
+State vectors capture the recent history of market returns that will be used as input to our neural network. The state represents the "memory" of the system at any given time.
+
+```{r state_vector, class.output="fold-hide"}
+#' Create state vector from return data
+#' 
+#' @param return_data Tibble containing return data with return_percentage column
+#' @param time_index Integer representing the time index for state creation
+#' @param window_size Integer representing the lookback window size
+#' @return Numeric vector representing the state
+make_state <- function(return_data, time_index, window_size = 10) {
+  if (time_index < window_size) {
+    stop("Time index must be greater than or equal to window size")
+  }
+  
+  return_data$return_percentage[(time_index - window_size + 1):time_index]
+}
+
+# Demonstrate state vector creation
+demo_state_vector <- make_state(spy_returns, time_index = 15)
+cat("State vector at t=15:", paste(round(demo_state_vector, 3), collapse = ", "), "\n")
+```
+
+**State Vector Interpretation:**
+- Each state vector contains the last 10 daily returns
+- This captures short-term market momentum and volatility patterns
+- The neural network will learn to map these patterns to optimal actions
+
+## Exercise 4: Q-Network Architecture Design
+
+The Q-network approximates the Q-function in reinforcement learning, estimating the expected future reward for each possible action given the current state.
+
+```{r q_network_architecture, class.output="fold-hide"}
+# Define action space and network parameters
+ACTIONS <- c("Long", "Flat")
+INPUT_NODES <- 10    # State vector dimension
+OUTPUT_NODES <- length(ACTIONS)  # Number of possible actions
+HIDDEN_UNITS <- 32   # Hidden layer size
+
+# Create Keras sequential model
+q_network_model <- keras_model_sequential() %>%
+  layer_dense(
+    units = HIDDEN_UNITS, 
+    activation = "relu", 
+    input_shape = c(INPUT_NODES),
+    name = "hidden_layer"
+  ) %>%
+  layer_dense(
+    units = OUTPUT_NODES, 
+    activation = "linear",
+    name = "q_values_output"
+  )
+
+# Display model architecture
+summary(q_network_model)
+cat("Q-Network model successfully created\n")
+```
+
+**Architecture Rationale:**
+- **Input Layer**: 10 nodes (recent return history)
+- **Hidden Layer**: 32 nodes with ReLU activation (non-linear feature extraction)
+- **Output Layer**: 2 nodes with linear activation (Q-values for Long/Flat actions)
+
+**Output Interpretation:**
+- First output: Q-value for "Long" action (expected reward for buying)
+- Second output: Q-value for "Flat" action (expected reward for holding cash)
+
+## Exercise 5: Artificial Target Generation
+
+```{r target_generation, class.output="fold-hide"}
+#' Generate training targets for Q-network
+#' 
+#' @param num_samples Integer number of training samples to generate
+#' @param returns_data Tibble containing return data
+#' @return List containing states matrix and targets matrix
+generate_training_targets <- function(num_samples = 256, returns_data = spy_returns) {
+  # Sample random time indices (avoiding boundary conditions)
+  sample_idx <- sample(
+    10:(length(returns_data$return_percentage) - 1), 
+    num_samples
+  )
+  
+  # Create state matrix (each row is a state vector)
+  states_mat <- t(sapply(sample_idx, function(i) make_state(returns_data, i)))
+  
+  # Extract current and next period returns
+  return_t <- returns_data$return_percentage[sample_idx]
+  return_t_plus_1 <- returns_data$return_percentage[sample_idx + 1]
+  
+  # Generate targets: reward for "Long" action based on trend continuation
+  y_long <- as.numeric(return_t_plus_1 > return_t)
+  
+  list(
+    states = states_mat, 
+    targets = cbind(y_long = y_long, y_flat = 1 - y_long)
+  )
+}
+
+# Generate training data
+training_data <- generate_training_targets(256)
+cat("Training targets generated:\n")
+cat("Long signals:", sum(training_data$targets[, "y_long"]), "\n")
+cat("Flat signals:", sum(training_data$targets[, "y_flat"]), "\n")
+```
+
+**Agent Strategy Interpretation:**
+This target generation creates a **trend-following agent** that:
+- Goes long when expecting returns to continue in the same direction
+- Stays flat when trend reversal is expected
+- Uses simple momentum-based logic for target generation
+
+## Exercise 6: Model Training and Compilation
+
+```{r model_training, class.output="fold-hide"}
+#' Train the Q-network model
+#' 
+#' @param states_data Matrix of state vectors
+#' @param targets_data Matrix of target Q-values
+#' @param epochs Integer number of training epochs
+#' @param lr Numeric learning rate for optimization
+#' @param model_to_train Keras model object to train
+#' @return List containing trained model, loss history, and final MSE
+train_q_network <- function(states_data, targets_data, epochs = 20, lr = 0.001, model_to_train = q_network_model) {
+  # Configure optimizer
+  optimizer <- optimizer_adam(learning_rate = lr)
+  
+  # Compile model
+  model_to_train %>% compile(
+    optimizer = optimizer, 
+    loss = "mse",
+    metrics = c("mae")
+  )
+  
+  # Train model
+  history <- model_to_train %>% fit(
+    x = states_data,
+    y = targets_data,
+    epochs = epochs,
+    batch_size = 32,
+    validation_split = 0.2,
+    verbose = 1
+  )
+  
+  list(
+    model = model_to_train, 
+    loss_history = history$metrics$loss, 
+    final_mse = tail(history$metrics$loss, 1)
+  )
+}
+
+#' Plot training loss curve
+#' 
+#' @param loss_history Numeric vector of loss values by epoch
+#' @return ggplot object
+plot_loss_curve <- function(loss_history) {
+  loss_df <- data.frame(
+    epoch = 1:length(loss_history), 
+    loss = loss_history
+  )
+  
+  ggplot2::ggplot(loss_df, ggplot2::aes(x = epoch, y = loss)) +
+    ggplot2::geom_line(color = "red", size = 1) +
+    ggplot2::geom_point(color = "darkred", size = 2) +
+    ggplot2::labs(
+      title = "Q-Network Training Loss",
+      subtitle = "Mean Squared Error by Epoch",
+      x = "Epoch", 
+      y = "MSE Loss"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12)
+    )
+}
+
+# Train the model
+training_results <- train_q_network(training_data$states, training_data$targets)
+cat("Final training MSE:", round(training_results$final_mse, 5), "\n")
+```
+
+### Training Loss Visualization
+
+```{r loss_plot, class.output="fold-hide", fig.show="hold"}
+print(plot_loss_curve(training_results$loss_history))
+```
+
+## Exercise 7: Q-Function Inspection and Analysis
+
+```{r q_function_inspection, class.output="fold-hide"}
+#' Predict Q-values for a given state
+#' 
+#' @param state_v Numeric vector representing the state
+#' @param model Trained Keras model
+#' @return Named numeric vector of Q-values for each action
+predict_q_values <- function(state_v, model) {
+  # Reshape input for Keras prediction
+  input_for_predict <- array_reshape(state_v, c(1, INPUT_NODES))
+  
+  # Get Q-value predictions
+  q_vals <- model %>% predict(input_for_predict, verbose = 0)
+  
+  # Return named vector
+  setNames(as.vector(q_vals), ACTIONS)
+}
+
+#' Inspect Q-function performance on current market state
+#' 
+#' @param model Trained Keras model
+#' @param returns_data Tibble containing return data
+#' @return Named numeric vector of current Q-values
+inspect_q_function <- function(model, returns_data = spy_returns) {
+  # Get most recent state
+  current_state <- make_state(returns_data, nrow(returns_data))
+  
+  # Predict Q-values
+  q_vals_named <- predict_q_values(current_state, model)
+  
+  # Display results
+  cat("=== Q-Function Analysis ===\n")
+  cat("Current state (last 10 returns):", paste(round(current_state, 3), collapse = ", "), "\n")
+  cat("Q-values:\n")
+  cat("  Long:", round(q_vals_named["Long"], 4), "\n")
+  cat("  Flat:", round(q_vals_named["Flat"], 4), "\n")
+  
+  # Determine optimal action
+  optimal_action <- ifelse(
+    q_vals_named["Long"] > q_vals_named["Flat"], 
+    "GO LONG", 
+    "STAY FLAT"
+  )
+  cat("Recommended Action:", optimal_action, "\n")
+  
+  return(q_vals_named)
+}
+
+# Perform Q-function inspection
+current_q_values <- inspect_q_function(training_results$model)
+```
