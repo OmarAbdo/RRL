@@ -1,0 +1,443 @@
+
+---
+title: "Neural Networks in Finance - Task 2"
+author: "Group D"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+library(quantmod)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(keras)
+set.seed(42)
+```
+
+## Exercise 1: State 2.0
+
+In this exercise, we extend the `make_state(t, pos)` function so that the output state vector includes both the **last 10 daily returns** and the **current position** of the agent.
+
+
+In reinforcement learning, a **state** is a complete description of the situation the agent is currently in. For a trading agent, this means:
+
+- The **market conditions**, represented by the last 10 returns.
+- The **agent’s internal state**, specifically whether it is already holding a position (long) or is flat.
+Including the position in the state is crucial because the same return environment can lead to very different outcomes depending on whether the agent is currently invested (position = 1) or not (position = 0). For example, if the agent holds a position and the return is negative, it will incur a loss, whereas if it is not invested, it will neither gain nor lose. This distinction is essential for the network to understand the consequences of actions. Without knowing the current position, the model cannot accurately learn when to buy, sell, or hold, nor can it understand how different actions affect the agent’s equity depending on its exposure to the market.
+
+If we do **not** include the position:
+- The model cannot tell whether taking an action will open a position, close it, or maintain it.
+- For example, staying "long" versus going "long" from a flat state will have different transaction costs or implications.
+
+By including the position, the agent learns to make decisions based on both market momentum **and** whether it is currently exposed to the market.
+
+```{r}
+get_spy_returns <- function(start_date = "2015-01-01") {
+  # Fetch raw market data
+  raw_data <- quantmod::getSymbols(
+    "SPY", 
+    src = "yahoo", 
+    from = start_date, 
+    auto.assign = FALSE, 
+    warnings = FALSE
+  )
+  
+  # Transform to clean data frame structure
+  prices_df <- data.frame(
+    date = index(Ad(raw_data)), 
+    price = as.numeric(Ad(raw_data))
+  ) %>% 
+    as_tibble()
+  
+  # Calculate percentage returns
+  prices_df %>%
+    dplyr::mutate(
+      return_percentage = (price / lag(price, 1) - 1) * 100
+    ) %>%
+    dplyr::filter(!is.na(return_percentage)) %>%
+    dplyr::select(date, price, return_percentage)
+}
+
+# Loading SPY data
+spy_returns <- get_spy_returns("2015-01-01")
+cat("SPY returns loaded:", nrow(spy_returns), "observations\n")
+
+make_state <- function(t, pos, returns, window_size = 10) {
+  state_vector <- returns[(t - window_size + 1):t]
+  c(state_vector, pos)
+}
+
+# Picking a time step (e.g., t = 20)
+t <- 20
+pos <- 1  # assume the agent is long
+
+# Extract just the numeric return column from your tibble
+returns_vector <- spy_returns$return_percentage
+
+# Calling the function
+state <- make_state(t, pos, returns_vector)
+
+# Printing it
+print(state)
+
+# Printing Output
+cat("Last 10 returns:\n", state[1:10], "\n")
+cat("Position (last element):", state[11], "\n")
+
+```
+
+## Exercise 2: Understanding the Environment Theory
+
+In reinforcement learning, the **environment** is everything that the agent interacts with. It provides the context in which the agent takes actions and receives feedback (called **rewards**).
+
+In our trading scenario, the environment simulates a simplified financial market. It must contain all the necessary information that changes over time and affects how the agent behaves.
+
+###  What does our environment keep track of?
+
+Our environment keeps track of the following critical pieces of information:
+
+1. **Time (`t`)** – which day we're currently on in the dataset  
+   - The state is always based on the last 10 returns, so we need to know where we are in time.
+2. **Position (`pos`)** – whether the agent is currently invested (1 = long) or not (0 = flat)  
+   - This affects the reward and the outcome of actions.
+3. **Equity (`equity`)** – how much value the agent’s portfolio has  
+   - It changes over time depending on whether the agent makes or loses money.
+4. **Done flag (`done`)** – a boolean that tells us if we’ve reached the end of the data  
+   - Helps stop the simulation once there's no more return data to use.
+
+###  Why is this important?
+
+Without keeping track of this information, we cannot simulate:
+- The effect of an action (buying or staying flat)
+- The financial outcome of that action
+- The transition to the next state (next returns + updated position)
+
+All of this forms the feedback loop that lets the agent learn.
+
+ In our case, the environment acts like a **financial simulator**. It gives the agent a new state after each action and tells the agent how good or bad the action was by returning a **reward**.
+
+This setup aligns perfectly with the structure of reinforcement learning:
+- The agent observes a **state**
+- Takes an **action**
+- Receives a **reward**
+- Moves to a new **state**
+- This cycle continues until the end (`done = TRUE`)
+
+## Exercise 3: Environment Application
+
+we begin coding our **trading environment** using two helper functions. These functions simulate how an agent interacts with the financial market from day to day.
+
+### Part (a): `env_reset()`
+This function simply initializes the environment:
+
+We start at t = 10 because we need the last 10 returns to create the first state.
+
+pos = 0 means we begin with no investment (flat).
+
+equity = 1 means we start with normalized capital (like €1 or $1).
+
+done = FALSE because the simulation is just beginning.
+
+```{r}
+env_reset <- function() {
+  list(t = 10, pos = 0, equity = 1, done = FALSE)
+}
+```
+
+
+### Part (b): env_step(env, action)
+This function updates the environment after the agent takes an action. Here's how:
+
+1. Advance time by one day (we go from t to t + 1).
+2. Check the agent's position and action:
+    If the agent buys (action == 1) and is not invested, they enter a position and
+    pay transaction costs.
+    If the agent is already invested and stays in the trade, they gain or lose based 
+    on the return.
+    If they sell (action == 0) while holding, they close the position and pay a 
+    small cost.
+3. Calculate new equity (total money) based on the reward.
+
+4. Build the next environment state (new t, pos, equity, and done).
+
+5. Create the next observation (state) using make_state().
+
+6. Return everything as a list.
+
+
+```{r}
+getSymbols("SPY", src = "yahoo", from = "2015-01-01")
+spy_returns <- dailyReturn(Cl(SPY)) * 100
+returns <- as.numeric(spy_returns)
+env_step <- function(env, action, transaction_cost = 0.0005) {
+  t <- env$t
+  pos <- env$pos
+  equity <- env$equity
+
+  if (t >= length(returns) - 1) {
+    return(list(next_env = env, reward = 0, obs = rep(0, 11), done = TRUE))
+  }
+
+  r_t1 <- returns[t + 1] / 100
+  reward <- 0
+
+  if (action == 1 && pos == 0) {
+    reward <- r_t1 - transaction_cost
+    pos <- 1
+  } else if (action == 0 && pos == 1) {
+    reward <- -transaction_cost
+    pos <- 0
+  } else if (action == 1 && pos == 1) {
+    reward <- r_t1
+  }
+
+  equity <- equity * (1 + reward)  # 🟢 Apply reward to equity here
+
+  t <- t + 1
+  done <- (t >= length(returns) - 1)
+  next_env <- list(t = t, pos = pos, equity = equity, done = done)
+  obs <- make_state(t, pos, returns)
+  list(next_env = next_env, reward = reward, obs = obs, done = done)
+}
+head(spy_returns)
+
+```
+These two functions allow us to simulate a basic financial market.
+The agent can take actions, earn or lose rewards, and progress through time.
+This structure is essential for reinforcement learning to work. Without an environment, the agent wouldn’t have anything to learn from!
+
+## Exercise 4:  Environment Test
+
+In this exercise, we simulate a simple trading policy where the agent **enters a long position at time `t = 11`** and then **stays invested (long) for 10 periods**.
+
+We want to observe how the agent's **equity** changes over time as a result of this strategy.
+
+### Strategy
+1. Starting from a clean environment (`env_reset()`).
+2. At time `t = 11`, executing a **"buy"** action (`action = 1`) to enter the position.
+3. For the next 9 time steps, **stay long** (`action = 1`) at each step.
+4. Tracking the agent’s **equity** at each step.
+
+```{r}
+# Resetting the environment to t = 10 (so we can act at t = 11)
+env <- env_reset()
+
+# Storing equity over time for plotting
+equity_history <- numeric(11)
+equity_history[1] <- env$equity
+
+## Preparing Data
+getSymbols("SPY", src = "yahoo", from = "2015-01-01", auto.assign = TRUE)
+spy_prices <- Ad(SPY)
+spy_df <- tibble(
+  date = index(spy_prices),
+  price = as.numeric(spy_prices)
+)
+
+
+# Step 1: Enter long at t = 11
+spy_returns <- get_spy_returns("2015-01-01")
+
+
+returns <- spy_returns$return_percentage
+
+step1 <- env_step(env, action = 1, transaction_cost = 0.0005)
+env <- step1$next_env
+equity_history[2] <- env$equity
+
+# Steps 2–10: Stay long (action = 1)
+for (i in 3:11) {
+  step_result <- env_step(env, action = 1, transaction_cost = 0.0005)
+  env <- step_result$next_env
+  equity_history[i] <- env$equity
+}
+
+# Visualizing how equity evolved over time
+equity_df <- data.frame(
+  step = 1:11,
+  equity = equity_history
+)
+
+ggplot(equity_df, aes(x = step, y = equity)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_point(color = "darkblue", size = 2) +
+  labs(
+    title = "Equity Over 10 Steps While Staying Long",
+    x = "Step (Time t)",
+    y = "Equity"
+  ) +
+  theme_minimal()
+```
+In the graph above, we see how the agent’s equity (money) changes over 10 days when it buys a stock and simply holds it without taking any further action.
+
+The simulation starts with equity = 1, meaning the agent begins with 1 unit of capital.
+
+In the first few steps, the equity increases — this shows that the market was moving up, and the agent made a profit by staying invested. In the middle and later steps, the equity falls, indicating that the stock price declined during that period, reducing the value of the agent’s investment.
+
+Overall, we see typical market fluctuations — some gains followed by losses. The agent never sold the stock; it just held the position the entire time. This "buy-and-hold" strategy highlights how an investor’s returns depend directly on market performance.
+
+This experiment helps us understand how an agent’s capital can grow or shrink over time based on market conditions, even without changing strategy. It lays the foundation for training smarter agents who can react to these movements in the future.
+
+
+
+
+## Exercise 5:Replay Buffer Initialization
+To help the agent learn, we create a "replay buffer" that stores past experiences. This will be used later when we want to train the agent using batches of past data instead of only the most recent one.
+
+
+```{r replay-buffer-init, message=FALSE}
+state_size <- 11
+dummy_state <- as.numeric(rep(0, state_size))
+
+# (a) Creating a replay buffer using new.env()
+replay_buffer <- new.env()
+
+# Setting the buffer capacity
+buffer_capacity <- 5000
+state_size <- 11  # 10 returns + 1 position indicator
+
+# (b) Initializing buffer elements
+replay_buffer$s  <- matrix(0, nrow = buffer_capacity, ncol = state_size)   # states
+replay_buffer$a  <- integer(buffer_capacity)                               # actions (0 or 1)
+replay_buffer$r  <- numeric(buffer_capacity)                               # rewards
+replay_buffer$s2 <- matrix(0, nrow = buffer_capacity, ncol = state_size)   # next states
+replay_buffer$done <- logical(buffer_capacity)                             # whether episode ended
+
+# Index to store next experience
+replay_buffer$idx <- 1
+
+# Boolean flag to check if buffer is full
+replay_buffer$is_full <- FALSE
+
+# Function to update index and check full condition
+update_replay_index <- function(buffer) {
+  buffer$idx <- buffer$idx + 1
+  if (buffer$idx > buffer_capacity) {
+    buffer$idx <- 1
+    buffer$is_full <- TRUE
+  }
+}
+# Simulate updating buffer index
+update_replay_index(replay_buffer)
+
+cat("Current index:", replay_buffer$idx, "\n")
+cat("Is buffer full?:", replay_buffer$is_full, "\n")
+
+```
+
+## Exercise 6: Replay buffer functions
+
+We enhance the functionality of our replay buffer to support training through two key operations. First, we implement the store_transition() function, which records the agent’s current experience—namely the state (s), the action taken (a), the reward received (r), the next state (s0), and whether the episode has ended (done)—into the buffer at the current index. After storing, the index (idx) is updated to the next slot, and if the buffer has reached its maximum capacity (e.g., 5000 entries), the index loops back to the beginning, allowing the buffer to overwrite the oldest data in a circular fashion. This ensures that the buffer can continuously accommodate new experiences without growing indefinitely.
+
+Second, we define the sample_batch(n) function, which randomly selects n past transitions from the replay buffer for training the agent’s neural network. Random sampling breaks the correlation between consecutive experiences and improves training stability by ensuring a more diverse and representative learning signal. The function internally checks whether the buffer is full or partially filled and selects samples accordingly from the valid portion. These randomly selected batches simulate a more independent and identically distributed (i.i.d.) training process, which is crucial for reinforcement learning algorithms to perform well.
+
+```{r}
+
+store_transition <- function(buffer, s, a, r, s2, done) {
+  idx <- buffer$idx
+  
+  buffer$s[idx, ]    <- s
+  buffer$a[idx]      <- a
+  buffer$r[idx]      <- r
+  buffer$s2[idx, ]   <- s2
+  buffer$done[idx]   <- done
+  
+  # Update index
+  buffer$idx <- buffer$idx + 1
+  if (buffer$idx > buffer_capacity) {
+    buffer$idx <- 1
+    buffer$is_full <- TRUE
+  }
+}
+sample_batch <- function(buffer, n) {
+  max_index <- if (buffer$is_full) buffer_capacity else (buffer$idx - 1)
+  sampled_idx <- sample(1:max_index, size = n, replace = FALSE)
+  
+  list(
+    s_batch    = buffer$s[sampled_idx, , drop = FALSE],
+    a_batch    = buffer$a[sampled_idx],
+    r_batch    = buffer$r[sampled_idx],
+    s2_batch   = buffer$s2[sampled_idx, , drop = FALSE],
+    done_batch = buffer$done[sampled_idx],
+    idx_used   = sampled_idx  # Just for testing randomness
+  )
+}
+
+set.seed(123)  # For reproducibility
+
+# Simulate filling the buffer with dummy transitions
+
+dummy_state <- rep(0, state_size)
+for (i in 1:1000) {
+  store_transition(replay_buffer, dummy_state, 0, 0, dummy_state, FALSE)
+}
+
+batch1 <- sample_batch(replay_buffer, n = 5)
+batch2 <- sample_batch(replay_buffer, n = 5)
+
+cat("Sample 1 indices:", batch1$idx_used, "\n")
+cat("Sample 2 indices:", batch2$idx_used, "\n")
+```
+Since the indices are different between the two samples, it confirms that each call to sample_batch() gives uncorrelated (random) entries, which is good for training the neural network. It prevents the model from learning patterns that are just due to sequential data and helps generalize better.
+
+## Exercise 7: Sanity Check
+
+```{r}
+# Reset environment and initialize equity tracker
+env <- env_reset()
+equity_sanity <- numeric(11)
+equity_sanity[1] <- env$equity  # Starting equity at step 0
+
+# Loop through 10 steps, always buying, and record equity
+for (i in 2:11) {
+  result <- env_step(env, action = 1)  # Agent stays long
+  env <- result$next_env
+  equity_sanity[i] <- env$equity  # Record equity after step
+}
+## Final Equity 
+cat("Final Equity of Investor:", round(env$equity, 4), "\n")
+cat("Number of transitions in Replay Buffer:", replay_buffer$idx - 1, "\n")
+```
+The final equity of the investor, 1.0009, reflects a very slight gain over the 10 steps of always staying long in the market. This indicates that during this short trading period, the stock price movement was relatively flat with minor fluctuations. Additionally, the replay buffer now contains 1001 recorded transitions, which means our environment successfully tracked and stored each experience—state, action, reward, next state, and done flag—throughout the simulation. These transitions will be useful later for training the reinforcement learning agent using experience replay.
+
+```{r}
+# Create data frame for plotting
+sanity_df <- data.frame(
+  step = 0:10,
+  equity = equity_sanity
+)
+
+# Plot
+library(ggplot2)
+ggplot(sanity_df, aes(x = step, y = equity)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "darkblue", size = 2) +
+  labs(
+    title = "Sanity Check: Equity Over 10 Steps (Always Buy)",
+    x = "Step",
+    y = "Equity"
+  ) +
+  theme_minimal()
+```
+The chart confirms that the agent’s equity rises and falls based on market movement while consistently staying in a long position. Initially, equity increases with positive returns, peaking around step 4. It then declines as the market turns, before showing small recoveries and fluctuations. This visual reinforces that even a simple “always buy” strategy is sensitive to return volatility, and the final equity reflects the net outcome of these daily shifts. It effectively validates our environment and equity update logic.
+
+
+
+## Summary
+In our trading environment, the done flag helps stop the simulation when we reach the end of the data. We start with equity = 1 to mean the investor begins with one unit of money, making it easy to track gains or losses. We begin at t = window_size (not t = 1) because the agent needs the last 10 returns to build a full state. If transaction costs doubled, we would reduce the reward more when trades happen, which makes the agent more careful about buying or selling. Finally, we sample random (uncorrelated) experiences from the replay buffer so the agent doesn’t learn from only recent patterns—this helps the model become more stable and smarter in the long run.
