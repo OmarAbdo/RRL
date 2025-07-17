@@ -5,35 +5,28 @@ if (!requireNamespace("progress", quietly = TRUE)) install.packages("progress")
 library(progress)
 
 ## HYPER-PARAMETERS  -----------------------------------------------------
-# For quick training on a Core i7 CPU (minutes instead of hours), consider these alternative configurations:
-# episodes          <- 10 # Fewer episodes
-# replay_capacity   <- 1000 # Smaller replay buffer
-# warmup_mem        <- 100 # Faster warmup
-# hidden_units      <- 16 # Smaller network
+# --- Battery Parameters (from PDF) ---
+battery_capacity_mwh <- 1.0 # Usable energy: 1 MWh
+power_limit_mw <- 0.5 # Power limit: 0.5 MW
+efficiency <- 0.9 # Round-trip efficiency: 90%
+trade_cost <- 20 # Degradation cost: 20 EUR/MWh throughput
+interval_hours <- 0.25 # Time interval: 15 minutes (0.25 hours)
+energy_per_step_mwh <- power_limit_mw * interval_hours # Max energy per step
 
-window_size <- 10 # look-back bars → state vector length
-state_dim <- window_size + 1 # returns window  +  current position
-hidden_units <- 16 #  32                 ## lower for quick training
-learning_rate <- 1e-3
-gamma <- 0.99 # discount
-episodes <- 5 # 100       # +/- depending on patience ## lower for quick training
-
-batch_size <- 32
-replay_capacity <- 1000 # 5000   ## lower for quick training
-warmup_mem <- 50 # 200    ## no training until buffer this large ## lower for quick training
-target_sync_freq <- 10 # episodes
-
-eps_start <- 1.0 # ε-greedy schedule
-eps_final <- 0.05
-
-trade_cost <- 0.02
-
-# Battery parameters
-battery_capacity_mwh <- 1.0
-power_limit_mw <- 0.5
-efficiency <- 0.9
-interval_hours <- 0.25 # 15 minutes
-energy_per_step_mwh <- power_limit_mw * interval_hours
+# --- RL Agent & Training Parameters (not specified in PDF) ---
+window_size <- 10 # Look-back window for state representation
+state_dim <- window_size + 2 # State vector: price window + current SoC + current price
+hidden_units <- 32 # Network size (reduced for quick training)
+episodes <- 10 # Training episodes (reduced for quick training)
+replay_capacity <- 3000 # Max size of replay buffer (reduced for quick training)
+warmup_mem <- 300 # Steps before training starts (reduced for quick training)
+trade_penalty <- 0.1 # Penalty for taking a charge/discharge action (not in PDF)
+learning_rate <- 1e-3 # Adam optimizer learning rate
+gamma <- 0.99 # Discount factor for future rewards
+batch_size <- 32 # Replay buffer batch size
+target_sync_freq <- 10 # Episodes before target network sync
+eps_start <- 1.0 # Epsilon-greedy starting value
+eps_final <- 0.05 # Epsilon-greedy final value
 
 
 ## LOAD DATA  ------------------------------------------------------------
@@ -64,7 +57,8 @@ max_steps_ep <- n_obs - window_size - 1 # guard against infinite loops
 
 ## STATE: # t is  (window_size : n_obs-1) and current battery state of charge (0-1)
 make_state <- function(t, soc) {
-  c(as.numeric(rets[(t - window_size + 1):t]), soc)
+  current_price <- prices_for_env[t]
+  c(as.numeric(rets[(t - window_size + 1):t]), soc, current_price)
 }
 
 
@@ -95,7 +89,7 @@ env_step <- function(env, action) {
     soc_next <- soc + charge_amount_eff / battery_capacity_mwh
     cost <- charge_amount * current_price / 1000 # Convert MWh to kWh for price
     degradation_cost <- charge_amount * trade_cost
-    reward <- -cost - degradation_cost
+    reward <- -cost - degradation_cost - trade_penalty
     energy_moved <- charge_amount
   } else if (action == 2) { # Discharge
     discharge_amount <- min(energy_per_step_mwh, soc * battery_capacity_mwh)
@@ -103,7 +97,7 @@ env_step <- function(env, action) {
     soc_next <- soc - discharge_amount / battery_capacity_mwh
     revenue <- discharge_amount_eff * current_price / 1000 # Convert MWh to kWh for price
     degradation_cost <- discharge_amount * trade_cost
-    reward <- revenue - degradation_cost
+    reward <- revenue - degradation_cost - trade_penalty
     energy_moved <- discharge_amount
   } else { # Hold
     soc_next <- soc
@@ -198,7 +192,7 @@ for (ep in 1:episodes) {
     format = "    Step :step/:total [:bar] :percent",
     total = max_steps_ep, clear = FALSE, width = 50
   )
-  max_steps_ep <- 1000 # Reduced for quick training
+  max_steps_ep <- 2000 # Reduced for quick training
   for (step in 1:max_steps_ep) {
     pb_steps_baseline$tick()
     # choose action
