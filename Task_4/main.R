@@ -1,5 +1,8 @@
 library(keras)
 library(quantmod)
+library(tensorflow)
+if (!requireNamespace("progress", quietly = TRUE)) install.packages("progress")
+library(progress)
 
 ## HYPER-PARAMETERS  -----------------------------------------------------
 # For quick training on a Core i7 CPU (minutes instead of hours), consider these alternative configurations:
@@ -132,7 +135,7 @@ build_qnet <- function() {
   hidden <- input %>% layer_dense(hidden_units, activation = "relu")
   output <- hidden %>% layer_dense(3, activation = "linear") # 3 outputs for Hold, Charge, Discharge
   keras_model(input, output) %>%
-    compile(optimizer = optimizer_adam(learning_rate), loss = "mse")
+    compile(optimizer = tf$keras$optimizers$legacy$Adam(learning_rate = learning_rate), loss = "mse")
 }
 
 ## REPLAY BUFFER  --------------------------------------------------------
@@ -180,18 +183,24 @@ qnet_baseline <- build_qnet()
 target_net_baseline <- build_qnet()
 target_net_baseline$set_weights(qnet_baseline$get_weights())
 
-qnet_baseline %>% compile(
-  optimizer = optimizer_adam(learning_rate = learning_rate),
-  loss = "mse"
-)
-
 cat("\nStarting Baseline Agent Training...\n")
+pb_baseline <- progress_bar$new(
+  format = "  Episode :ep/:total [:bar] :percent in :elapsed | ETA: :eta",
+  total = episodes, clear = FALSE, width = 60
+)
 for (ep in 1:episodes) {
   env <- env_reset()
   state <- make_state(env$t, env$soc) # Changed env$pos to env$soc
   eps <- epsilon(ep)
   ep_reward <- 0
+
+  pb_steps_baseline <- progress_bar$new(
+    format = "    Step :step/:total [:bar] :percent",
+    total = max_steps_ep, clear = FALSE, width = 50
+  )
+  max_steps_ep <- 1000 # Reduced for quick training
   for (step in 1:max_steps_ep) {
+    pb_steps_baseline$tick()
     # choose action
     if (runif(1) < eps) {
       action <- sample(0:2, 1)
@@ -226,15 +235,16 @@ for (ep in 1:episodes) {
     target_net_baseline$set_weights(qnet_baseline$get_weights())
   }
 
+  pb_baseline$tick()
   cat(sprintf(
-    "Episode %3d | steps = %3d | reward = %.4f | equity = %.3f\n",
-    ep, step, ep_reward, env$equity
+    " | Episode Reward: %.4f | Equity: %.3f\n",
+    ep_reward, env$equity
   ))
 }
 
 # Save the trained baseline network weights (T5)
-save_model_weights_hdf5(qnet_baseline, "Task_4/model_weights_baseline.h5")
-cat("Baseline agent model weights saved to Task_4/model_weights_baseline.h5\n")
+save_model_weights_hdf5(qnet_baseline, "model_weights_baseline.h5")
+cat("Baseline agent model weights saved to model_weights_baseline.h5\n")
 
 
 ## T4: Mandatory Enhancement (DDQN) Training and Saving --------------------------------------------------------
@@ -243,18 +253,24 @@ qnet <- build_qnet()
 target_net <- build_qnet()
 target_net$set_weights(qnet$get_weights())
 
-qnet %>% compile(
-  optimizer = optimizer_adam(learning_rate = learning_rate),
-  loss = "mse"
-)
-
 cat("\nStarting DDQN Agent Training...\n")
+pb_ddqn <- progress_bar$new(
+  format = "  Episode :ep/:total [:bar] :percent in :elapsed | ETA: :eta",
+  total = episodes, clear = FALSE, width = 60
+)
 for (ep in 1:episodes) {
   env <- env_reset()
   state <- make_state(env$t, env$soc)
   eps <- epsilon(ep)
   ep_reward <- 0
+
+  pb_steps_ddqn <- progress_bar$new(
+    format = "    Step :step/:total [:bar] :percent",
+    total = max_steps_ep, clear = FALSE, width = 50
+  )
+
   for (step in 1:max_steps_ep) {
+    pb_steps_ddqn$tick()
     # choose action
     if (runif(1) < eps) {
       action <- sample(0:2, 1)
@@ -294,15 +310,16 @@ for (ep in 1:episodes) {
     target_net$set_weights(qnet$get_weights())
   }
 
+  pb_ddqn$tick()
   cat(sprintf(
-    "Episode %3d | steps = %3d | reward = %.4f | equity = %.3f\n",
-    ep, step, ep_reward, env$equity
+    " | Episode Reward: %.4f | Equity: %.3f\n",
+    ep_reward, env$equity
   ))
 }
 
 # Save the trained DDQN model weights (T5)
-save_model_weights_hdf5(qnet, "Task_4/model_weights_ddqn.h5")
-cat("Trained DDQN model weights saved to Task_4/model_weights_ddqn.h5
+save_model_weights_hdf5(qnet, "model_weights_ddqn.h5")
+cat("Trained DDQN model weights saved to model_weights_ddqn.h5
 ")
 
 
