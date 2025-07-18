@@ -17,6 +17,7 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(keras)
   library(tibble)
+  library(progress)
 })
 
 set.seed(42)
@@ -27,15 +28,15 @@ set.seed(42)
 data <- read_csv("data_task4.csv")
 
 # The data is in reverse chronological order, so we need to reverse it.
-data <- data %>% arrange(DateTime)
+data <- data %>% arrange(`DateTime(UTC)`)
 
 # We will use the price column for our environment.
-prices <- data$Price
+prices <- data$`Price[Currency/MWh]`
 
 # --- Configuration and Hyperparameters ---
 # Data split
-train_years <- 1
-test_years <- 1
+train_years <- 0.02
+test_years <- 0.01
 steps_per_year <- 365 * 24 * 4
 train_end_idx <- steps_per_year * train_years
 test_end_idx <- train_end_idx + (steps_per_year * test_years)
@@ -70,7 +71,7 @@ target_net_update_freq <- 2 # episodes
 
 # --- Environment Functions ---
 # The state will consist of a window of past prices and the current state-of-charge (SoC).
-make_state <- function(t, soc, prices_data, window_size = window_size) {
+make_state <- function(t, soc, prices_data) {
   # Ensure we don't go before the start of the price data
   start_index <- max(1, t - window_size + 1)
   state_vector <- prices_data[start_index:t]
@@ -85,7 +86,7 @@ make_state <- function(t, soc, prices_data, window_size = window_size) {
 }
 
 # Reset the environment to its initial state
-env_reset <- function(prices_data, window_size = window_size) {
+env_reset <- function(prices_data) {
   list(
     t = window_size,
     soc = start_soc,
@@ -96,8 +97,7 @@ env_reset <- function(prices_data, window_size = window_size) {
 }
 
 # Execute a step in the environment
-env_step <- function(env, action, window_size = window_size) {
-
+env_step <- function(env, action) {
   t <- env$t
   soc <- env$soc
   profit <- env$profit
@@ -143,7 +143,7 @@ env_step <- function(env, action, window_size = window_size) {
   done <- (t >= length(prices_data) - 1)
 
   next_env <- list(t = t, soc = soc, profit = profit, done = done, prices_data = prices_data)
-  obs <- make_state(t, soc, prices_data, window_size)
+  obs <- make_state(t, soc, prices_data)
 
   list(next_env = next_env, reward = reward, obs = obs, done = done)
 }
@@ -169,7 +169,7 @@ store_transition <- function(buffer, s, a, r, s2, done) {
   buffer$done[idx] <- done
 
   buffer$idx <- buffer$idx + 1
-  if (buffer$idx > buffer_capacity) {
+  if (buffer$idx > replay_capacity) {
     buffer$idx <- 1
     buffer$is_full <- TRUE
   }
@@ -214,13 +214,24 @@ online_net %>% compile(
 
 episode_log <- list()
 
+pb_episodes <- progress_bar$new(
+  format = "Episodes [:bar] :percent eta: :eta",
+  total = total_episodes, clear = FALSE, width = 60
+)
+
 for (ep in 1:total_episodes) {
   env <- env_reset(train_prices)
   state <- make_state(env$t, env$soc, env$prices_data)
 
   episode_profit <- 0
 
+  pb_steps <- progress_bar$new(
+    format = paste0("  Episode ", ep, " [:bar] :percent eta: :eta"),
+    total = max_steps_ep, clear = FALSE, width = 60
+  )
+
   for (step in 1:max_steps_ep) {
+    pb_steps$tick()
     epsilon <- epsilon_decay(ep, start = epsilon_start, final = epsilon_final, decay_rate = epsilon_decay_rate)
     if (runif(1) < epsilon) {
       action <- sample(0:2, 1) # Explore
@@ -260,12 +271,13 @@ for (ep in 1:total_episodes) {
     if (done) break
   }
 
-if (ep %% target_net_update_freq == 0) {
-  target_net %>% set_weights(online_net %>% get_weights())
-}
+  if (ep %% target_net_update_freq == 0) {
+    target_net %>% set_weights(online_net %>% get_weights())
+  }
 
   episode_log[[ep]] <- list(profit = episode_profit)
-  cat(sprintf("Episode: %d, Final Profit: %.2f\n", ep, episode_profit))
+  pb_episodes$tick()
+  cat(sprintf("\nEpisode: %d, Final Profit: %.2f\n", ep, episode_profit))
 }
 
 # --- T2: Benchmarks & T3: Evaluation ---
@@ -368,6 +380,10 @@ replay_buffer_ddqn$done <- logical(replay_capacity)
 replay_buffer_ddqn$idx <- 1
 replay_buffer_ddqn$is_full <- FALSE
 
+pb_episodes_ddqn <- progress_bar$new(
+  format = "DDQN Episodes [:bar] :percent eta: :eta",
+  total = total_episodes, clear = FALSE, width = 60
+)
 
 for (ep in 1:total_episodes) {
   env <- env_reset(train_prices)
@@ -375,7 +391,13 @@ for (ep in 1:total_episodes) {
 
   episode_profit <- 0
 
+  pb_steps_ddqn <- progress_bar$new(
+    format = paste0("  DDQN Episode ", ep, " [:bar] :percent eta: :eta"),
+    total = max_steps_ep, clear = FALSE, width = 60
+  )
+
   for (step in 1:max_steps_ep) {
+    pb_steps_ddqn$tick()
     epsilon <- epsilon_decay(ep, start = epsilon_start, final = epsilon_final, decay_rate = epsilon_decay_rate)
     if (runif(1) < epsilon) {
       action <- sample(0:2, 1)
@@ -420,12 +442,13 @@ for (ep in 1:total_episodes) {
     if (done) break
   }
 
-if (ep %% target_net_update_freq == 0) {
-  target_net_ddqn %>% set_weights(online_net_ddqn %>% get_weights())
-}
+  if (ep %% target_net_update_freq == 0) {
+    target_net_ddqn %>% set_weights(online_net_ddqn %>% get_weights())
+  }
 
   episode_log_ddqn[[ep]] <- list(profit = episode_profit)
-  cat(sprintf("DDQN Episode: %d, Final Profit: %.2f\n", ep, episode_profit))
+  pb_episodes_ddqn$tick()
+  cat(sprintf("\nDDQN Episode: %d, Final Profit: %.2f\n", ep, episode_profit))
 }
 
 # --- T5: Store your weights ---
