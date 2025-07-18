@@ -35,8 +35,9 @@ prices <- data$`Price[Currency/MWh]`
 
 # --- Configuration and Hyperparameters ---
 # Data split
-train_years <- 0.02
-test_years <- 0.01
+# Reduced for quick debugging as requested
+train_years <- 1
+test_years <- 0.25
 steps_per_year <- 365 * 24 * 4
 train_end_idx <- steps_per_year * train_years
 test_end_idx <- train_end_idx + (steps_per_year * test_years)
@@ -98,7 +99,6 @@ env_reset <- function(prices_data) {
 
 # Execute a step in the environment
 env_step <- function(env, action) {
-
   t <- env$t
   soc <- env$soc
   profit <- env$profit
@@ -272,89 +272,14 @@ for (ep in 1:total_episodes) {
     if (done) break
   }
 
-if (ep %% target_net_update_freq == 0) {
-  target_net %>% set_weights(online_net %>% get_weights())
-}
+  if (ep %% target_net_update_freq == 0) {
+    target_net %>% set_weights(online_net %>% get_weights())
+  }
 
   episode_log[[ep]] <- list(profit = episode_profit)
   pb_episodes$tick()
   cat(sprintf("\nEpisode: %d, Final Profit: %.2f\n", ep, episode_profit))
 }
-
-# --- T2: Benchmarks & T3: Evaluation ---
-
-# Function to evaluate a policy on the test set
-evaluate_policy <- function(policy_func, prices_data) {
-  env <- env_reset(prices_data)
-  state <- make_state(env$t, env$soc, env$prices_data)
-
-  soc_history <- c(env$soc)
-  profit_history <- c(env$profit)
-  action_history <- c()
-
-  while (!env$done) {
-    action <- policy_func(state, env)
-
-    step_result <- env_step(env, action)
-    state <- step_result$obs
-    env <- step_result$next_env
-
-    soc_history <- c(soc_history, env$soc)
-    profit_history <- c(profit_history, env$profit)
-    action_history <- c(action_history, action)
-  }
-
-  return(list(soc = soc_history, profit = profit_history, actions = action_history))
-}
-
-# 1. Trained Agent Policy
-agent_policy <- function(state, env) {
-  q_values <- online_net %>% predict(t(state), verbose = 0)
-  which.max(q_values) - 1
-}
-
-# 2. Random Policy
-random_policy <- function(state, env) {
-  sample(0:2, 1)
-}
-
-# 3. Heuristic Policy
-heuristic_policy <- function(state, env) {
-  current_price <- env$prices_data[env$t]
-  if (current_price < 0) {
-    return(1) # Charge if price is negative
-  } else if (current_price > 50) { # Example threshold for selling
-    return(2) # Discharge if price is high
-  } else {
-    return(0) # Do nothing
-  }
-}
-
-# Run evaluations
-agent_results <- evaluate_policy(agent_policy, test_prices)
-random_results <- evaluate_policy(random_policy, test_prices)
-heuristic_results <- evaluate_policy(heuristic_policy, test_prices)
-
-# Print final profits
-cat(sprintf("Final Profit (Agent): %.2f\n", tail(agent_results$profit, 1)))
-cat(sprintf("Final Profit (Random): %.2f\n", tail(random_results$profit, 1)))
-cat(sprintf("Final Profit (Heuristic): %.2f\n", tail(heuristic_results$profit, 1)))
-
-# Plotting the results
-plot_df <- data.frame(
-  Step = 1:length(agent_results$profit),
-  Agent = agent_results$profit,
-  Random = random_results$profit,
-  Heuristic = heuristic_results$profit
-)
-
-ggplot(plot_df, aes(x = Step)) +
-  geom_line(aes(y = Agent, colour = "Agent")) +
-  geom_line(aes(y = Random, colour = "Random")) +
-  geom_line(aes(y = Heuristic, colour = "Heuristic")) +
-  labs(title = "Agent vs. Benchmark Policies", y = "Cumulative Profit", x = "Time Steps") +
-  scale_colour_manual("", values = c("Agent" = "blue", "Random" = "red", "Heuristic" = "green")) +
-  theme_minimal()
 
 # --- T4: Mandatory Enhancement (Double-DQN) ---
 # The core difference in DDQN is in the calculation of the target Q-value.
@@ -443,14 +368,157 @@ for (ep in 1:total_episodes) {
     if (done) break
   }
 
-if (ep %% target_net_update_freq == 0) {
-  target_net_ddqn %>% set_weights(online_net_ddqn %>% get_weights())
-}
+  if (ep %% target_net_update_freq == 0) {
+    target_net_ddqn %>% set_weights(online_net_ddqn %>% get_weights())
+  }
 
   episode_log_ddqn[[ep]] <- list(profit = episode_profit)
   pb_episodes_ddqn$tick()
   cat(sprintf("\nDDQN Episode: %d, Final Profit: %.2f\n", ep, episode_profit))
 }
+
+# --- T2: Benchmarks & T3: Evaluation ---
+
+# Enhanced function to evaluate a policy and return a detailed tibble
+evaluate_policy <- function(policy_func, prices_data, policy_name) {
+  env <- env_reset(prices_data)
+  state <- make_state(env$t, env$soc, env$prices_data)
+
+  # Pre-allocate a list to store rows, which is more efficient than tibble::add_row
+  results_list <- vector("list", length(prices_data))
+  i <- 1
+
+  while (!env$done) {
+    action <- policy_func(state, env)
+
+    results_list[[i]] <- list(
+      step = env$t - window_size,
+      price = prices_data[env$t],
+      soc = env$soc,
+      action = action,
+      profit = env$profit,
+      policy = policy_name
+    )
+    i <- i + 1
+
+    step_result <- env_step(env, action)
+    state <- step_result$obs
+    env <- step_result$next_env
+  }
+
+  # Combine the list of rows into a single tibble and remove empty rows
+  bind_rows(results_list) %>% filter(!is.na(step))
+}
+
+
+# 1. Trained DQN Agent Policy
+dqn_policy <- function(state, env) {
+  q_values <- online_net %>% predict(t(state), verbose = 0)
+  which.max(q_values) - 1
+}
+
+# 2. Trained DDQN Agent Policy
+ddqn_policy <- function(state, env) {
+  q_values <- online_net_ddqn %>% predict(t(state), verbose = 0)
+  which.max(q_values) - 1
+}
+
+# 3. Random Policy
+random_policy <- function(state, env) {
+  sample(0:2, 1)
+}
+
+# 4. Heuristic Policy
+heuristic_policy <- function(state, env) {
+  current_price <- env$prices_data[env$t]
+  # A simple heuristic: charge when price is negative, discharge when high
+  if (current_price < 0) {
+    return(1) # Charge
+  } else if (current_price > 50) {
+    return(2) # Discharge
+  } else {
+    return(0) # Do nothing
+  }
+}
+
+# Run evaluations for all policies
+cat("\n--- Running Evaluations ---\n")
+dqn_results <- evaluate_policy(dqn_policy, test_prices, "DQN")
+ddqn_results <- evaluate_policy(ddqn_policy, test_prices, "DDQN")
+random_results <- evaluate_policy(random_policy, test_prices, "Random")
+heuristic_results <- evaluate_policy(heuristic_policy, test_prices, "Heuristic")
+
+# Combine all results into one tibble
+all_results <- bind_rows(dqn_results, ddqn_results, random_results, heuristic_results) %>%
+  mutate(policy = factor(policy, levels = c("DQN", "DDQN", "Random", "Heuristic")))
+
+# Save detailed results to CSV
+write_csv(all_results, "evaluation_results.csv")
+cat("Detailed evaluation results saved to evaluation_results.csv\n")
+
+# Print final profits
+final_profits <- all_results %>%
+  group_by(policy) %>%
+  summarise(final_profit = last(profit), .groups = "drop")
+
+print("Final Profits:")
+print(final_profits)
+
+# --- Generate Plots ---
+cat("\n--- Generating Plots ---\n")
+
+# 1. Cumulative Profit Plot
+profit_plot <- ggplot(all_results, aes(x = step, y = profit, color = policy)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Cumulative Profit Comparison",
+    subtitle = "Performance of Different Agents on the Test Set",
+    x = "Time Step (15-min intervals)",
+    y = "Cumulative Profit (EUR)",
+    color = "Policy"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_color_brewer(palette = "Set1")
+
+ggsave("profit_plot.png", plot = profit_plot, width = 10, height = 6, bg = "white")
+cat("Cumulative profit plot saved to profit_plot.png\n")
+
+
+# 2. Agent Behavior Plot (DQN vs DDQN)
+agent_behavior_data <- all_results %>%
+  filter(policy %in% c("DQN", "DDQN")) %>%
+  mutate(action_label = case_when(
+    action == 1 ~ "Charge",
+    action == 2 ~ "Discharge",
+    TRUE ~ "Hold"
+  )) %>%
+  filter(action_label != "Hold") # Only plot charge/discharge actions
+
+behavior_plot <- ggplot(agent_behavior_data, aes(x = step)) +
+  geom_line(aes(y = price), color = "black", alpha = 0.6) +
+  geom_point(aes(y = price, color = action_label), size = 2.5, alpha = 0.8) +
+  geom_line(aes(y = soc * 100), color = "blue", linetype = "dashed", alpha = 0.7) + # Scale SoC for visibility
+  facet_wrap(~policy, ncol = 1) +
+  scale_y_continuous(
+    name = "Electricity Price (EUR/MWh)",
+    sec.axis = sec_axis(~ . / 100, name = "State of Charge (%)", labels = scales::percent)
+  ) +
+  scale_color_manual(values = c("Charge" = "green", "Discharge" = "red")) +
+  labs(
+    title = "Agent Trading Behavior",
+    subtitle = "Comparing DQN and DDQN Strategies Against Market Price",
+    x = "Time Step (15-min intervals)",
+    color = "Action"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    axis.title.y.right = element_text(color = "blue"),
+    axis.text.y.right = element_text(color = "blue")
+  )
+
+ggsave("agent_behavior_plot.png", plot = behavior_plot, width = 12, height = 8, bg = "white")
+cat("Agent behavior plot saved to agent_behavior_plot.png\n")
 
 # --- T5: Store your weights ---
 save_model_weights_hdf5(online_net, "model_weights_baseline.h5")
