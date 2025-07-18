@@ -4,6 +4,15 @@ library(tensorflow)
 if (!requireNamespace("progress", quietly = TRUE)) install.packages("progress")
 library(progress)
 
+# Dynamic working directory resolution
+if (interactive() && requireNamespace("rstudioapi", quietly = TRUE)) {
+  this_file <- rstudioapi::getActiveDocumentContext()$path
+} else {
+  args <- commandArgs(trailingOnly = FALSE)
+  this_file <- normalizePath(sub("--file=", "", args[grep("--file=", args)]))
+}
+setwd(dirname(this_file))
+
 ## HYPER-PARAMETERS  -----------------------------------------------------
 # --- Battery Parameters (from PDF) ---
 battery_capacity_mwh <- 1.0 # Usable energy: 1 MWh
@@ -20,7 +29,6 @@ hidden_units <- 32 # Network size (reduced for quick training)
 episodes <- 10 # Training episodes (reduced for quick training)
 replay_capacity <- 2000 # Max size of replay buffer (reduced for quick training)
 warmup_mem <- 200 # Steps before training starts (reduced for quick training)
-trade_penalty <- 0.1 # Penalty for taking a charge/discharge action (not in PDF)
 learning_rate <- 1e-3 # Adam optimizer learning rate
 gamma <- 0.99 # Discount factor for future rewards
 batch_size <- 32 # Replay buffer batch size
@@ -48,6 +56,9 @@ price <- data$Price.Currency.MWh.
 # Calculate the price changes (returns) as a percentage for state representation
 rets <- na.omit(diff(price) / price[-length(price)]) * 100 # % price changes
 
+# Normalize prices for the state representation to stabilize learning
+price_norm <- (price - mean(price)) / sd(price)
+
 # training and test split
 train_size <- floor(0.8 * length(rets))
 rets_train <- rets[1:train_size]
@@ -55,13 +66,15 @@ rets_test <- rets[(train_size + 1):length(rets)]
 
 rets <- rets_train # Use training returns for state in training loop
 prices_for_env <- price[1:length(rets_train)] # Use training prices for environment in training loop
+price_norm_for_env <- price_norm[1:length(rets_train)] # Use normalized prices for state in training loop
 n_obs <- length(rets)
 max_steps_ep <- n_obs - window_size - 1 # guard against infinite loops
 
 ## STATE: # t is  (window_size : n_obs-1) and current battery state of charge (0-1)
 make_state <- function(t, soc) {
-  current_price <- prices_for_env[t]
-  c(as.numeric(rets[(t - window_size + 1):t]), soc, current_price)
+  # Use normalized price in state for better learning
+  current_price_norm <- price_norm_for_env[t]
+  c(as.numeric(rets[(t - window_size + 1):t]), soc, current_price_norm)
 }
 
 
@@ -78,30 +91,36 @@ env_step <- function(env, action) {
   soc <- env$soc
   equity <- env$equity
 
-  # Get current price
+  # Get current price (raw price for reward calculation)
   current_price <- prices_for_env[t2]
 
-  # Initialize reward and energy moved
+  # Initialize reward
   reward <- 0
-  energy_moved <- 0
+
+  # Correct efficiency application (sqrt applied at each stage for round-trip)
+  sqrt_efficiency <- sqrt(efficiency)
 
   # Action: 0 = Hold, 1 = Charge, 2 = Discharge
   if (action == 1) { # Charge
+    # How much can we charge?
     charge_amount <- min(energy_per_step_mwh, battery_capacity_mwh - soc * battery_capacity_mwh)
-    charge_amount_eff <- charge_amount * efficiency
-    soc_next <- soc + charge_amount_eff / battery_capacity_mwh
-    cost <- charge_amount * current_price / 1000 # Convert MWh to kWh for price
+    # Update SoC considering charging efficiency
+    soc_next <- soc + (charge_amount * sqrt_efficiency) / battery_capacity_mwh
+    # BUG FIX: Cost calculation should not be divided by 1000. Prices and energy are both in MWh.
+    cost <- charge_amount * current_price
     degradation_cost <- charge_amount * trade_cost
-    reward <- -cost - degradation_cost - trade_penalty
-    energy_moved <- charge_amount
+    reward <- -cost - degradation_cost
   } else if (action == 2) { # Discharge
+    # How much can we discharge?
     discharge_amount <- min(energy_per_step_mwh, soc * battery_capacity_mwh)
-    discharge_amount_eff <- discharge_amount * efficiency
+    # Energy that actually gets sold after discharge efficiency
+    energy_sold <- discharge_amount * sqrt_efficiency
+    # Update SoC
     soc_next <- soc - discharge_amount / battery_capacity_mwh
-    revenue <- discharge_amount_eff * current_price / 1000 # Convert MWh to kWh for price
+    # BUG FIX: Revenue calculation should not be divided by 1000.
+    revenue <- energy_sold * current_price
     degradation_cost <- discharge_amount * trade_cost
-    reward <- revenue - degradation_cost - trade_penalty
-    energy_moved <- discharge_amount
+    reward <- revenue - degradation_cost
   } else { # Hold
     soc_next <- soc
     reward <- 0
@@ -249,7 +268,7 @@ for (ep in 1:episodes) {
     format = "    Step :step/:total [:bar] :percent",
     total = max_steps_ep, clear = FALSE, width = 50
   )
-  max_steps_ep <- 500 # Reduced for quick training
+
   for (step in 1:max_steps_ep) {
     pb_steps_baseline$tick()
     # choose action
@@ -298,80 +317,79 @@ save_model_weights_hdf5(qnet_baseline, "model_weights_baseline.h5")
 cat("Baseline agent model weights saved to model_weights_baseline.h5\n")
 
 
-# ## T4: Mandatory Enhancement (DDQN) Training and Saving --------------------------------------------------------
-# # Re-initialize qnet and target_net for DDQN training
-# qnet <- build_qnet()
-# target_net <- build_qnet()
-# target_net$set_weights(qnet$get_weights())
-#
-# cat("\nStarting DDQN Agent Training...\n")
-# pb_ddqn <- progress_bar$new(
-#   format = "  Episode :ep/:total [:bar] :percent in :elapsed | ETA: :eta",
-#   total = episodes, clear = FALSE, width = 60
-# )
-# for (ep in 1:episodes) {
-#   env <- env_reset()
-#   state <- make_state(env$t, env$soc)
-#   eps <- epsilon(ep)
-#   ep_reward <- 0
-#
-#   pb_steps_ddqn <- progress_bar$new(
-#     format = "    Step :step/:total [:bar] :percent",
-#     total = max_steps_ep, clear = FALSE, width = 50
-#   )
-#
-#   for (step in 1:max_steps_ep) {
-#     pb_steps_ddqn$tick()
-#     # choose action
-#     if (runif(1) < eps) {
-#       action <- sample(0:2, 1)
-#     } # explore (0: Hold, 1: Charge, 2: Discharge)
-#     else {
-#       action <- which.max(predict(qnet, matrix(state, nrow = 1), verbose = 0)) - 1
-#     } # exploit
-#
-#     # interact
-#     res <- env_step(env, action)
-#     store_transition(state, action, res$reward, res$obs, res$next_env$done)
-#
-#     state <- res$obs
-#     env <- res$next_env
-#     ep_reward <- ep_reward + res$reward
-#     if (env$done) break
-#
-#     # learn
-#     if ((replay$full || replay$idx > warmup_mem)) {
-#       batch <- sample_batch(batch_size)
-#       # Double DQN: Use online_net to select action, target_net to evaluate Q-value
-#       q_online_next <- predict(qnet, batch$S2, verbose = 0)
-#       best_actions <- apply(q_online_next, 1, which.max) - 1 # Get the action indices (0, 1, or 2)
-#
-#       q_target_next <- predict(target_net, batch$S2, verbose = 0)
-#       q_max <- q_target_next[cbind(seq_len(batch_size), best_actions + 1)]
-#
-#       y <- batch$R + (1 - batch$D) * gamma * q_max
-#       y_keras <- predict(qnet, batch$S, verbose = 0) # this is only needed to generate q values for actions not taken
-#       y_keras[cbind(seq_len(batch_size), batch$A + 1)] <- y # crucial mostly for keras, we set the y value only for taken actions to get their loss (y-q)^2 and leave the rest to the original q-values, essentially setting their loss to be 0 (q-q)^2
-#       qnet %>% train_on_batch(batch$S, y_keras) # y_keras is the artificial "true" target, so we train the qnet to predict these values
-#     }
-#   }
-#
-#   # target network sync
-#   if (ep %% target_sync_freq == 0) {
-#     target_net$set_weights(qnet$get_weights())
-#   }
-#
-#   pb_ddqn$tick()
-#   cat(sprintf(
-#     " | Episode Reward: %.4f | Equity: %.3f\n",
-#     ep_reward, env$equity
-#   ))
-# }
-#
-# # Save the trained DDQN model weights (T5)
-# save_model_weights_hdf5(qnet, "model_weights_ddqn.h5")
-# cat("Trained DDQN model weights saved to model_weights_ddqn.h5
-# ")
+## T4: Mandatory Enhancement (DDQN) Training and Saving --------------------------------------------------------
+# Re-initialize qnet and target_net for DDQN training
+qnet_ddqn <- build_qnet()
+target_net_ddqn <- build_qnet()
+target_net_ddqn$set_weights(qnet_ddqn$get_weights())
+
+cat("\nStarting DDQN Agent Training...\n")
+pb_ddqn <- progress_bar$new(
+  format = "  Episode :ep/:total [:bar] :percent in :elapsed | ETA: :eta",
+  total = episodes, clear = FALSE, width = 60
+)
+for (ep in 1:episodes) {
+  env <- env_reset()
+  state <- make_state(env$t, env$soc)
+  eps <- epsilon(ep)
+  ep_reward <- 0
+
+  pb_steps_ddqn <- progress_bar$new(
+    format = "    Step :step/:total [:bar] :percent",
+    total = max_steps_ep, clear = FALSE, width = 50
+  )
+
+  for (step in 1:max_steps_ep) {
+    pb_steps_ddqn$tick()
+    # choose action
+    if (runif(1) < eps) {
+      action <- sample(0:2, 1)
+    } # explore (0: Hold, 1: Charge, 2: Discharge)
+    else {
+      action <- which.max(predict(qnet_ddqn, matrix(state, nrow = 1), verbose = 0)) - 1
+    } # exploit
+
+    # interact
+    res <- env_step(env, action)
+    store_transition(state, action, res$reward, res$obs, res$next_env$done)
+
+    state <- res$obs
+    env <- res$next_env
+    ep_reward <- ep_reward + res$reward
+    if (env$done) break
+
+    # learn
+    if ((replay$full || replay$idx > warmup_mem)) {
+      batch <- sample_batch(batch_size)
+      # Double DQN: Use online_net to select action, target_net to evaluate Q-value
+      q_online_next <- predict(qnet_ddqn, batch$S2, verbose = 0)
+      best_actions <- apply(q_online_next, 1, which.max) - 1 # Get the action indices (0, 1, or 2)
+
+      q_target_next <- predict(target_net_ddqn, batch$S2, verbose = 0)
+      q_max <- q_target_next[cbind(seq_len(batch_size), best_actions + 1)]
+
+      y <- batch$R + (1 - batch$D) * gamma * q_max
+      y_keras <- predict(qnet_ddqn, batch$S, verbose = 0) # this is only needed to generate q values for actions not taken
+      y_keras[cbind(seq_len(batch_size), batch$A + 1)] <- y # crucial mostly for keras, we set the y value only for taken actions to get their loss (y-q)^2 and leave the rest to the original q-values, essentially setting their loss to be 0 (q-q)^2
+      qnet_ddqn %>% train_on_batch(batch$S, y_keras) # y_keras is the artificial "true" target, so we train the qnet to predict these values
+    }
+  }
+
+  # target network sync
+  if (ep %% target_sync_freq == 0) {
+    target_net_ddqn$set_weights(qnet_ddqn$get_weights())
+  }
+
+  pb_ddqn$tick()
+  cat(sprintf(
+    " | Episode Reward: %.4f | Equity: %.3f\n",
+    ep_reward, env$equity
+  ))
+}
+
+# Save the trained DDQN model weights (T5)
+save_model_weights_hdf5(qnet_ddqn, "model_weights_ddqn.h5")
+cat("Trained DDQN model weights saved to model_weights_ddqn.h5\n")
 
 ## T4: Mandatory Enhancement (PER) Training and Saving --------------------------------------------------------
 qnet_per <- build_qnet()
@@ -444,9 +462,27 @@ cat("Trained PER model weights saved to model_weights_per.h5\n")
 qnet_baseline_eval <- build_qnet()
 load_model_weights_hdf5(qnet_baseline_eval, "model_weights_baseline.h5")
 
+# Load the trained DDQN model for evaluation
+qnet_ddqn_eval <- build_qnet()
+load_model_weights_hdf5(qnet_ddqn_eval, "model_weights_ddqn.h5")
+
 # Load the trained PER model for evaluation
 qnet_per_eval <- build_qnet()
 load_model_weights_hdf5(qnet_per_eval, "model_weights_per.h5")
+
+# Re-run the trained DDQN agent to get its equity curve
+env_ddqn_eval <- env_reset()
+state_ddqn_eval <- make_state(env_ddqn_eval$t, env_ddqn_eval$soc)
+ddqn_equity_curve <- c(env_ddqn_eval$equity)
+
+for (step in 1:max_steps_ep) {
+  action <- which.max(predict(qnet_ddqn_eval, matrix(state_ddqn_eval, nrow = 1), verbose = 0)) - 1L
+  res <- env_step(env_ddqn_eval, action)
+  state_ddqn_eval <- res$obs
+  env_ddqn_eval <- res$next_env
+  ddqn_equity_curve <- c(ddqn_equity_curve, env_ddqn_eval$equity)
+  if (env_ddqn_eval$done) break
+}
 
 # Re-run the trained PER agent to get its equity curve
 env_agent <- env_reset()
@@ -511,11 +547,12 @@ for (step in 1:max_steps_ep) {
 }
 
 # Plotting
-max_len <- max(length(agent_equity_curve), length(random_equity_curve), length(heuristic_equity_curve), length(baseline_equity_curve))
+max_len <- max(length(agent_equity_curve), length(random_equity_curve), length(heuristic_equity_curve), length(baseline_equity_curve), length(ddqn_equity_curve))
 
 plot_df <- data.frame(
   Step = 1:max_len,
   PER_Agent = c(agent_equity_curve, rep(NA, max_len - length(agent_equity_curve))),
+  DDQN_Agent = c(ddqn_equity_curve, rep(NA, max_len - length(ddqn_equity_curve))),
   Baseline_Agent = c(baseline_equity_curve, rep(NA, max_len - length(baseline_equity_curve))),
   Random = c(random_equity_curve, rep(NA, max_len - length(random_equity_curve))),
   Heuristic = c(heuristic_equity_curve, rep(NA, max_len - length(heuristic_equity_curve)))
@@ -525,9 +562,10 @@ library(ggplot2)
 
 ggplot(plot_df, aes(x = Step)) +
   geom_line(aes(y = PER_Agent, colour = "PER Agent")) +
+  geom_line(aes(y = DDQN_Agent, colour = "DDQN Agent")) +
   geom_line(aes(y = Baseline_Agent, colour = "Baseline Agent")) +
   geom_line(aes(y = Random, colour = "Random Policy")) +
   geom_line(aes(y = Heuristic, colour = "Heuristic Policy")) +
   labs(title = "Battery Agent vs. Benchmarks", y = "Equity", x = "Time Steps") +
-  scale_colour_manual("", values = c("PER Agent" = "blue", "Baseline Agent" = "purple", "Random Policy" = "red", "Heuristic Policy" = "green")) +
+  scale_colour_manual("", values = c("PER Agent" = "blue", "DDQN Agent" = "orange", "Baseline Agent" = "purple", "Random Policy" = "red", "Heuristic Policy" = "green")) +
   theme_minimal()
