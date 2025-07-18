@@ -98,6 +98,7 @@ env_reset <- function(prices_data) {
 
 # Execute a step in the environment
 env_step <- function(env, action) {
+
   t <- env$t
   soc <- env$soc
   profit <- env$profit
@@ -271,9 +272,9 @@ for (ep in 1:total_episodes) {
     if (done) break
   }
 
-  if (ep %% target_net_update_freq == 0) {
-    target_net %>% set_weights(online_net %>% get_weights())
-  }
+if (ep %% target_net_update_freq == 0) {
+  target_net %>% set_weights(online_net %>% get_weights())
+}
 
   episode_log[[ep]] <- list(profit = episode_profit)
   pb_episodes$tick()
@@ -442,9 +443,9 @@ for (ep in 1:total_episodes) {
     if (done) break
   }
 
-  if (ep %% target_net_update_freq == 0) {
-    target_net_ddqn %>% set_weights(online_net_ddqn %>% get_weights())
-  }
+if (ep %% target_net_update_freq == 0) {
+  target_net_ddqn %>% set_weights(online_net_ddqn %>% get_weights())
+}
 
   episode_log_ddqn[[ep]] <- list(profit = episode_profit)
   pb_episodes_ddqn$tick()
