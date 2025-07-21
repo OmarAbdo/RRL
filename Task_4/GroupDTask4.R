@@ -65,7 +65,7 @@ epsilon_final <- 0.01 # End with almost full exploitation.
 epsilon_decay_rate <- 0.001 # Decay rate for epsilon.
 batch_size <- 64 # Batch size for training.
 total_episodes <- 50 # Total number of training episodes.
-target_net_update_freq <- 2 # episodes
+target_net_update_freq <- 10 # update target network every 10 episodes.
 
 
 # --- T1: Baseline Agent ---
@@ -482,69 +482,74 @@ results_ddqn <- evaluate_policy(ddqn_policy, test_prices, "DDQN")
 results_random <- evaluate_policy(random_policy, test_prices, "Random")
 results_heuristic <- evaluate_policy(heuristic_policy, test_prices, "Heuristic")
 
-# Combine results into a single data frame
-n_steps <- length(results_dqn$actions)
-evaluation_df <- tibble(
-  Step = 1:n_steps,
-  Price = test_prices[window_size:(window_size + n_steps - 1)],
-  DQN_Profit = results_dqn$profit[2:(n_steps + 1)],
-  DQN_SoC = results_dqn$soc[2:(n_steps + 1)],
-  DQN_Action = results_dqn$actions,
-  DDQN_Profit = results_ddqn$profit[2:(n_steps + 1)],
-  DDQN_SoC = results_ddqn$soc[2:(n_steps + 1)],
-  DDQN_Action = results_ddqn$actions,
-  Random_Profit = results_random$profit[2:(n_steps + 1)],
-  Heuristic_Profit = results_heuristic$profit[2:(n_steps + 1)]
-)
+# Check if evaluation produced results before proceeding
+if (length(results_dqn$actions) > 0) {
+  # Combine results into a single data frame
+  n_steps <- length(results_dqn$actions)
+  evaluation_df <- tibble(
+    Step = 1:n_steps,
+    Price = test_prices[window_size:(window_size + n_steps - 1)],
+    DQN_Profit = results_dqn$profit[2:(n_steps + 1)],
+    DQN_SoC = results_dqn$soc[2:(n_steps + 1)],
+    DQN_Action = results_dqn$actions,
+    DDQN_Profit = results_ddqn$profit[2:(n_steps + 1)],
+    DDQN_SoC = results_ddqn$soc[2:(n_steps + 1)],
+    DDQN_Action = results_ddqn$actions,
+    Random_Profit = results_random$profit[2:(n_steps + 1)],
+    Heuristic_Profit = results_heuristic$profit[2:(n_steps + 1)]
+  )
 
-# Save evaluation results to CSV
-write_csv(evaluation_df, "evaluation_results.csv")
+  # Save evaluation results to CSV
+  write_csv(evaluation_df, "evaluation_results.csv")
 
-# --- Plotting ---
+  # --- Plotting ---
 
-# 1. Cumulative Profit Plot
-profit_plot_df <- evaluation_df %>%
-  select(Step, DQN_Profit, DDQN_Profit, Random_Profit, Heuristic_Profit) %>%
-  rename(DQN = DQN_Profit, DDQN = DDQN_Profit, Random = Random_Profit, Heuristic = Heuristic_Profit) %>%
-  tidyr::gather(key = "Policy", value = "Profit", -Step)
+  # 1. Cumulative Profit Plot
+  profit_plot_df <- evaluation_df %>%
+    select(Step, DQN_Profit, DDQN_Profit, Random_Profit, Heuristic_Profit) %>%
+    rename(DQN = DQN_Profit, DDQN = DDQN_Profit, Random = Random_Profit, Heuristic = Heuristic_Profit) %>%
+    tidyr::gather(key = "Policy", value = "Profit", -Step)
 
-profit_plot <- ggplot(profit_plot_df, aes(x = Step, y = Profit, color = Policy)) +
-  geom_line(size = 1) +
-  labs(
-    title = "Cumulative Profit Comparison",
-    x = "Time Step (15-min interval)",
-    y = "Cumulative Profit (EUR)",
-    color = "Policy"
-  ) +
-  theme_minimal() +
-  scale_color_brewer(palette = "Set1")
+  profit_plot <- ggplot(profit_plot_df, aes(x = Step, y = Profit, color = Policy)) +
+    geom_line(linewidth = 1) +
+    labs(
+      title = "Cumulative Profit Comparison",
+      x = "Time Step (15-min interval)",
+      y = "Cumulative Profit (EUR)",
+      color = "Policy"
+    ) +
+    theme_minimal() +
+    scale_color_brewer(palette = "Set1")
 
-ggsave("profit_plot.png", plot = profit_plot, width = 10, height = 6)
+  ggsave("profit_plot.png", plot = profit_plot, width = 10, height = 6)
 
-# 2. Agent Behavior Plot
-behavior_df <- evaluation_df %>%
-  select(Step, Price, DQN_SoC, DQN_Action, DDQN_SoC, DDQN_Action) %>%
-  rename(SoC_DQN = DQN_SoC, Action_DQN = DQN_Action, SoC_DDQN = DDQN_SoC, Action_DDQN = DDQN_Action) %>%
-  tidyr::gather(key = "Metric", value = "Value", -Step, -Price) %>%
-  tidyr::separate(Metric, into = c("Metric", "Agent"), sep = "_") %>%
-  tidyr::spread(key = Metric, value = Value)
+  # 2. Agent Behavior Plot
+  behavior_df <- evaluation_df %>%
+    select(Step, Price, DQN_SoC, DQN_Action, DDQN_SoC, DDQN_Action) %>%
+    rename(SoC_DQN = DQN_SoC, Action_DQN = DQN_Action, SoC_DDQN = DDQN_SoC, Action_DDQN = DDQN_Action) %>%
+    tidyr::gather(key = "Metric", value = "Value", -Step, -Price) %>%
+    tidyr::separate(Metric, into = c("Metric", "Agent"), sep = "_") %>%
+    tidyr::spread(key = Metric, value = Value)
 
-agent_behavior_plot <- ggplot(behavior_df, aes(x = Step)) +
-  geom_line(aes(y = Price), color = "black", size = 0.8) +
-  geom_line(aes(y = SoC * max(behavior_df$Price, na.rm = TRUE)), color = "blue", linetype = "dashed") +
-  geom_point(data = filter(behavior_df, Action == 1), aes(y = Price), color = "green", size = 2, alpha = 0.7) +
-  geom_point(data = filter(behavior_df, Action == 2), aes(y = Price), color = "red", size = 2, alpha = 0.7) +
-  scale_y_continuous(
-    name = "Electricity Price (EUR/MWh)",
-    sec.axis = sec_axis(~ . / max(behavior_df$Price, na.rm = TRUE), name = "State of Charge (SoC)")
-  ) +
-  facet_wrap(~Agent, nrow = 2) +
-  labs(
-    title = "Agent Trading Behavior vs. Market Price",
-    x = "Time Step (15-min interval)"
-  ) +
-  theme_bw()
+  agent_behavior_plot <- ggplot(behavior_df, aes(x = Step)) +
+    geom_line(aes(y = Price), color = "black", linewidth = 0.8) +
+    geom_line(aes(y = SoC * max(behavior_df$Price, na.rm = TRUE)), color = "blue", linetype = "dashed") +
+    geom_point(data = filter(behavior_df, Action == 1), aes(y = Price), color = "green", size = 2, alpha = 0.7) +
+    geom_point(data = filter(behavior_df, Action == 2), aes(y = Price), color = "red", size = 2, alpha = 0.7) +
+    scale_y_continuous(
+      name = "Electricity Price (EUR/MWh)",
+      sec.axis = sec_axis(~ . / max(behavior_df$Price, na.rm = TRUE), name = "State of Charge (SoC)")
+    ) +
+    facet_wrap(~Agent, nrow = 2) +
+    labs(
+      title = "Agent Trading Behavior vs. Market Price",
+      x = "Time Step (15-min interval)"
+    ) +
+    theme_bw()
 
-ggsave("agent_behavior_plot.png", plot = agent_behavior_plot, width = 12, height = 8)
+  ggsave("agent_behavior_plot.png", plot = agent_behavior_plot, width = 12, height = 8)
 
-cat("Evaluation complete. Plots and CSV saved.\n")
+  cat("Evaluation complete. Plots and CSV saved.\n")
+} else {
+  cat("\nEvaluation and plotting skipped because the test set is too small for the given window size.\n")
+}

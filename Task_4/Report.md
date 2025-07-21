@@ -40,7 +40,16 @@ The data used is the Austrian 15-minute day-ahead electricity prices from 2019-2
 
 ### Reinforcement Learning Agent
 
-A Deep Q-Network (DQN) agent was developed to learn the optimal trading policy. The agent's state representation was enhanced to include not just a window of past prices and the battery's state of charge, but also cyclical time-based features and rolling price statistics, providing a richer context for decision-making. This approach is inspired by the methodologies in (Ziel, Steinert, & Husmann, 2015), which emphasize the importance of incorporating seasonality and other fundamental drivers into electricity price models.
+A Deep Q-Network (DQN) agent was developed to learn the optimal trading policy. The agent's neural network takes the state of the environment as input and outputs the expected long-term reward (Q-value) for each possible action. Therefore, the number of input nodes in the network (`input_nodes`) must be equal to the size of the state vector (`state_size`).
+
+The state representation was enhanced to provide a rich context for decision-making. The `state_size` is calculated as `window_size + 1 + 8`, which breaks down as follows:
+- **Price Window (`window_size` = 96):** The last 96 historical 15-minute price points.
+- **State of Charge (1 feature):** The current energy level of the battery.
+- **Additional Features (8 features):**
+    - Cyclical representations of the hour, day, and year (6 features).
+    - The rolling mean and standard deviation of the price window (2 features).
+
+This results in a total state size of `96 + 1 + 8 = 105` features. This approach is inspired by the methodologies in (Ziel, Steinert, & Husmann, 2015), which emphasize the importance of incorporating seasonality and other fundamental drivers into electricity price models.
 
 ```R
 # Enhanced State Representation
