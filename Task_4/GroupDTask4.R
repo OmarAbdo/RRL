@@ -64,7 +64,7 @@ epsilon_start <- 1.0 # Start with full exploration.
 epsilon_final <- 0.01 # End with almost full exploitation.
 epsilon_decay_rate <- 0.001 # Decay rate for epsilon.
 batch_size <- 64 # Batch size for training.
-total_episodes <- 10 # Total number of training episodes.
+total_episodes <- 50 # Total number of training episodes.
 target_net_update_freq <- 2 # episodes
 
 
@@ -420,10 +420,17 @@ random_policy <- function(state, env) {
 # 4. Heuristic Policy
 heuristic_policy <- function(state, env) {
   current_price <- env$prices_data[env$t]
-  if (current_price < 0) {
-    return(1) # Charge if price is negative
-  } else if (current_price > 50) { # Example threshold for selling
-    return(2) # Discharge if price is high
+  rolling_mean <- state[window_size + 8]
+  rolling_sd <- state[window_size + 9]
+  
+  # Define thresholds based on rolling statistics (e.g., 1 standard deviation from the mean)
+  charge_threshold <- rolling_mean - 1.0 * rolling_sd
+  discharge_threshold <- rolling_mean + 1.0 * rolling_sd
+
+  if (current_price < charge_threshold) {
+    return(1) # Charge if the price is significantly low
+  } else if (current_price > discharge_threshold) {
+    return(2) # Discharge if the price is significantly high
   } else {
     return(0) # Do nothing
   }
@@ -432,20 +439,22 @@ heuristic_policy <- function(state, env) {
 # Function to evaluate a policy on the test set
 evaluate_policy <- function(policy_func, prices_data, policy_name = "Policy") {
   env <- env_reset(prices_data)
-  
+
   total_steps <- length(prices_data) - window_size
   if (total_steps <= 0) {
-    cat(sprintf("\nSkipping evaluation for %s: Not enough data points in test set (%d) for window size (%d).\n", 
-                policy_name, length(prices_data), window_size))
+    cat(sprintf(
+      "\nSkipping evaluation for %s: Not enough data points in test set (%d) for window size (%d).\n",
+      policy_name, length(prices_data), window_size
+    ))
     return(list(soc = c(env$soc), profit = c(env$profit), actions = c()))
   }
-  
+
   state <- make_state(env$t, env$soc, env$prices_data)
 
   soc_history <- c(env$soc)
   profit_history <- c(env$profit)
   action_history <- c()
-  
+
   pb_eval <- progress_bar$new(
     format = paste0("  Evaluating ", policy_name, " [:bar] :percent eta: :eta"),
     total = total_steps, clear = FALSE, width = 60
