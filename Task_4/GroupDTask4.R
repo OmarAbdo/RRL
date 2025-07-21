@@ -18,6 +18,7 @@ suppressPackageStartupMessages({
   library(keras)
   library(tibble)
   library(progress)
+  library(tidyr)
 })
 
 set.seed(42)
@@ -35,8 +36,7 @@ prices <- data$`Price[Currency/MWh]`
 
 # --- Configuration and Hyperparameters ---
 # Data split
-# Reduced for quick debugging as requested
-train_years <- 1
+train_years <- 2
 test_years <- 0.25
 steps_per_year <- 365 * 24 * 4
 train_end_idx <- steps_per_year * train_years
@@ -75,15 +75,30 @@ target_net_update_freq <- 2 # episodes
 make_state <- function(t, soc, prices_data) {
   # Ensure we don't go before the start of the price data
   start_index <- max(1, t - window_size + 1)
-  state_vector <- prices_data[start_index:t]
+  price_window <- prices_data[start_index:t]
 
   # Pad with initial price if the window is not full
-  if (length(state_vector) < window_size) {
-    padding <- rep(prices_data[1], window_size - length(state_vector))
-    state_vector <- c(padding, state_vector)
+  if (length(price_window) < window_size) {
+    padding <- rep(prices_data[1], window_size - length(price_window))
+    price_window <- c(padding, price_window)
   }
 
-  c(state_vector, soc)
+  # Time-based features
+  hour_of_day <- (t %% 96) / 96
+  day_of_week <- (t %% (96 * 7)) / (96 * 7)
+  day_of_year <- (t %% (96 * 365)) / (96 * 365)
+
+  # Price statistics
+  rolling_mean <- mean(price_window)
+  rolling_sd <- sd(price_window)
+
+  c(
+    price_window, soc,
+    sin(2 * pi * hour_of_day), cos(2 * pi * hour_of_day),
+    sin(2 * pi * day_of_week), cos(2 * pi * day_of_week),
+    sin(2 * pi * day_of_year), cos(2 * pi * day_of_year),
+    rolling_mean, rolling_sd
+  )
 }
 
 # Reset the environment to its initial state
@@ -106,7 +121,7 @@ env_step <- function(env, action) {
 
   # Check if the episode is over
   if (t >= length(prices_data) - 1) {
-    return(list(next_env = env, reward = 0, obs = rep(0, window_size + 1), done = TRUE))
+    return(list(next_env = env, reward = 0, obs = rep(0, window_size + 1 + 8), done = TRUE))
   }
 
   current_price <- prices_data[t]
@@ -151,7 +166,7 @@ env_step <- function(env, action) {
 
 # --- Replay Buffer ---
 replay_buffer <- new.env()
-state_size <- window_size + 1
+state_size <- window_size + 1 + 8
 
 replay_buffer$s <- matrix(0, nrow = replay_capacity, ncol = state_size)
 replay_buffer$a <- integer(replay_capacity)
@@ -377,47 +392,21 @@ for (ep in 1:total_episodes) {
   cat(sprintf("\nDDQN Episode: %d, Final Profit: %.2f\n", ep, episode_profit))
 }
 
-# --- T2: Benchmarks & T3: Evaluation ---
+# --- T5: Store your weights ---
+save_model_weights_hdf5(online_net, "model_weights_baseline.h5")
+save_model_weights_hdf5(online_net_ddqn, "model_weights_ddqn.h5")
 
-# Enhanced function to evaluate a policy and return a detailed tibble
-evaluate_policy <- function(policy_func, prices_data, policy_name) {
-  env <- env_reset(prices_data)
-  state <- make_state(env$t, env$soc, env$prices_data)
+cat("Model weights saved successfully.\n")
 
-  # Pre-allocate a list to store rows, which is more efficient than tibble::add_row
-  results_list <- vector("list", length(prices_data))
-  i <- 1
+# --- T2 & T3: Enhanced Evaluation ---
 
-  while (!env$done) {
-    action <- policy_func(state, env)
-
-    results_list[[i]] <- list(
-      step = env$t - window_size,
-      price = prices_data[env$t],
-      soc = env$soc,
-      action = action,
-      profit = env$profit,
-      policy = policy_name
-    )
-    i <- i + 1
-
-    step_result <- env_step(env, action)
-    state <- step_result$obs
-    env <- step_result$next_env
-  }
-
-  # Combine the list of rows into a single tibble and remove empty rows
-  bind_rows(results_list) %>% filter(!is.na(step))
-}
-
-
-# 1. Trained DQN Agent Policy
-dqn_policy <- function(state, env) {
+# 1. Trained Agent Policy (DQN)
+agent_policy <- function(state, env) {
   q_values <- online_net %>% predict(t(state), verbose = 0)
   which.max(q_values) - 1
 }
 
-# 2. Trained DDQN Agent Policy
+# 2. DDQN Policy
 ddqn_policy <- function(state, env) {
   q_values <- online_net_ddqn %>% predict(t(state), verbose = 0)
   which.max(q_values) - 1
@@ -431,97 +420,122 @@ random_policy <- function(state, env) {
 # 4. Heuristic Policy
 heuristic_policy <- function(state, env) {
   current_price <- env$prices_data[env$t]
-  # A simple heuristic: charge when price is negative, discharge when high
   if (current_price < 0) {
-    return(1) # Charge
-  } else if (current_price > 50) {
-    return(2) # Discharge
+    return(1) # Charge if price is negative
+  } else if (current_price > 50) { # Example threshold for selling
+    return(2) # Discharge if price is high
   } else {
     return(0) # Do nothing
   }
 }
 
-# Run evaluations for all policies
-cat("\n--- Running Evaluations ---\n")
-dqn_results <- evaluate_policy(dqn_policy, test_prices, "DQN")
-ddqn_results <- evaluate_policy(ddqn_policy, test_prices, "DDQN")
-random_results <- evaluate_policy(random_policy, test_prices, "Random")
-heuristic_results <- evaluate_policy(heuristic_policy, test_prices, "Heuristic")
+# Function to evaluate a policy on the test set
+evaluate_policy <- function(policy_func, prices_data, policy_name = "Policy") {
+  env <- env_reset(prices_data)
+  
+  total_steps <- length(prices_data) - window_size
+  if (total_steps <= 0) {
+    cat(sprintf("\nSkipping evaluation for %s: Not enough data points in test set (%d) for window size (%d).\n", 
+                policy_name, length(prices_data), window_size))
+    return(list(soc = c(env$soc), profit = c(env$profit), actions = c()))
+  }
+  
+  state <- make_state(env$t, env$soc, env$prices_data)
 
-# Combine all results into one tibble
-all_results <- bind_rows(dqn_results, ddqn_results, random_results, heuristic_results) %>%
-  mutate(policy = factor(policy, levels = c("DQN", "DDQN", "Random", "Heuristic")))
+  soc_history <- c(env$soc)
+  profit_history <- c(env$profit)
+  action_history <- c()
+  
+  pb_eval <- progress_bar$new(
+    format = paste0("  Evaluating ", policy_name, " [:bar] :percent eta: :eta"),
+    total = total_steps, clear = FALSE, width = 60
+  )
 
-# Save detailed results to CSV
-write_csv(all_results, "evaluation_results.csv")
-cat("Detailed evaluation results saved to evaluation_results.csv\n")
+  while (!env$done) {
+    pb_eval$tick()
+    action <- policy_func(state, env)
 
-# Print final profits
-final_profits <- all_results %>%
-  group_by(policy) %>%
-  summarise(final_profit = last(profit), .groups = "drop")
+    step_result <- env_step(env, action)
+    state <- step_result$obs
+    env <- step_result$next_env
 
-print("Final Profits:")
-print(final_profits)
+    soc_history <- c(soc_history, env$soc)
+    profit_history <- c(profit_history, env$profit)
+    action_history <- c(action_history, action)
+  }
 
-# --- Generate Plots ---
-cat("\n--- Generating Plots ---\n")
+  return(list(soc = soc_history, profit = profit_history, actions = action_history))
+}
+
+# Run all evaluations
+results_dqn <- evaluate_policy(agent_policy, test_prices, "DQN")
+results_ddqn <- evaluate_policy(ddqn_policy, test_prices, "DDQN")
+results_random <- evaluate_policy(random_policy, test_prices, "Random")
+results_heuristic <- evaluate_policy(heuristic_policy, test_prices, "Heuristic")
+
+# Combine results into a single data frame
+n_steps <- length(results_dqn$actions)
+evaluation_df <- tibble(
+  Step = 1:n_steps,
+  Price = test_prices[window_size:(window_size + n_steps - 1)],
+  DQN_Profit = results_dqn$profit[2:(n_steps + 1)],
+  DQN_SoC = results_dqn$soc[2:(n_steps + 1)],
+  DQN_Action = results_dqn$actions,
+  DDQN_Profit = results_ddqn$profit[2:(n_steps + 1)],
+  DDQN_SoC = results_ddqn$soc[2:(n_steps + 1)],
+  DDQN_Action = results_ddqn$actions,
+  Random_Profit = results_random$profit[2:(n_steps + 1)],
+  Heuristic_Profit = results_heuristic$profit[2:(n_steps + 1)]
+)
+
+# Save evaluation results to CSV
+write_csv(evaluation_df, "evaluation_results.csv")
+
+# --- Plotting ---
 
 # 1. Cumulative Profit Plot
-profit_plot <- ggplot(all_results, aes(x = step, y = profit, color = policy)) +
-  geom_line(linewidth = 1) +
+profit_plot_df <- evaluation_df %>%
+  select(Step, DQN_Profit, DDQN_Profit, Random_Profit, Heuristic_Profit) %>%
+  rename(DQN = DQN_Profit, DDQN = DDQN_Profit, Random = Random_Profit, Heuristic = Heuristic_Profit) %>%
+  tidyr::gather(key = "Policy", value = "Profit", -Step)
+
+profit_plot <- ggplot(profit_plot_df, aes(x = Step, y = Profit, color = Policy)) +
+  geom_line(size = 1) +
   labs(
     title = "Cumulative Profit Comparison",
-    subtitle = "Performance of Different Agents on the Test Set",
-    x = "Time Step (15-min intervals)",
+    x = "Time Step (15-min interval)",
     y = "Cumulative Profit (EUR)",
     color = "Policy"
   ) +
-  theme_minimal(base_size = 14) +
+  theme_minimal() +
   scale_color_brewer(palette = "Set1")
 
-ggsave("profit_plot.png", plot = profit_plot, width = 10, height = 6, bg = "white")
-cat("Cumulative profit plot saved to profit_plot.png\n")
+ggsave("profit_plot.png", plot = profit_plot, width = 10, height = 6)
 
+# 2. Agent Behavior Plot
+behavior_df <- evaluation_df %>%
+  select(Step, Price, DQN_SoC, DQN_Action, DDQN_SoC, DDQN_Action) %>%
+  rename(SoC_DQN = DQN_SoC, Action_DQN = DQN_Action, SoC_DDQN = DDQN_SoC, Action_DDQN = DDQN_Action) %>%
+  tidyr::gather(key = "Metric", value = "Value", -Step, -Price) %>%
+  tidyr::separate(Metric, into = c("Metric", "Agent"), sep = "_") %>%
+  tidyr::spread(key = Metric, value = Value)
 
-# 2. Agent Behavior Plot (DQN vs DDQN)
-agent_behavior_data <- all_results %>%
-  filter(policy %in% c("DQN", "DDQN")) %>%
-  mutate(action_label = case_when(
-    action == 1 ~ "Charge",
-    action == 2 ~ "Discharge",
-    TRUE ~ "Hold"
-  )) %>%
-  filter(action_label != "Hold") # Only plot charge/discharge actions
-
-behavior_plot <- ggplot(agent_behavior_data, aes(x = step)) +
-  geom_line(aes(y = price), color = "black", alpha = 0.6) +
-  geom_point(aes(y = price, color = action_label), size = 2.5, alpha = 0.8) +
-  geom_line(aes(y = soc * 100), color = "blue", linetype = "dashed", alpha = 0.7) + # Scale SoC for visibility
-  facet_wrap(~policy, ncol = 1) +
+agent_behavior_plot <- ggplot(behavior_df, aes(x = Step)) +
+  geom_line(aes(y = Price), color = "black", size = 0.8) +
+  geom_line(aes(y = SoC * max(behavior_df$Price, na.rm = TRUE)), color = "blue", linetype = "dashed") +
+  geom_point(data = filter(behavior_df, Action == 1), aes(y = Price), color = "green", size = 2, alpha = 0.7) +
+  geom_point(data = filter(behavior_df, Action == 2), aes(y = Price), color = "red", size = 2, alpha = 0.7) +
   scale_y_continuous(
     name = "Electricity Price (EUR/MWh)",
-    sec.axis = sec_axis(~ . / 100, name = "State of Charge (%)", labels = scales::percent)
+    sec.axis = sec_axis(~ . / max(behavior_df$Price, na.rm = TRUE), name = "State of Charge (SoC)")
   ) +
-  scale_color_manual(values = c("Charge" = "green", "Discharge" = "red")) +
+  facet_wrap(~Agent, nrow = 2) +
   labs(
-    title = "Agent Trading Behavior",
-    subtitle = "Comparing DQN and DDQN Strategies Against Market Price",
-    x = "Time Step (15-min intervals)",
-    color = "Action"
+    title = "Agent Trading Behavior vs. Market Price",
+    x = "Time Step (15-min interval)"
   ) +
-  theme_bw(base_size = 14) +
-  theme(
-    legend.position = "bottom",
-    axis.title.y.right = element_text(color = "blue"),
-    axis.text.y.right = element_text(color = "blue")
-  )
+  theme_bw()
 
-ggsave("agent_behavior_plot.png", plot = behavior_plot, width = 12, height = 8, bg = "white")
-cat("Agent behavior plot saved to agent_behavior_plot.png\n")
+ggsave("agent_behavior_plot.png", plot = agent_behavior_plot, width = 12, height = 8)
 
-# --- T5: Store your weights ---
-save_model_weights_hdf5(online_net, "model_weights_baseline.h5")
-save_model_weights_hdf5(online_net_ddqn, "model_weights_ddqn.h5")
-
-cat("Model weights saved successfully.\n")
+cat("Evaluation complete. Plots and CSV saved.\n")
